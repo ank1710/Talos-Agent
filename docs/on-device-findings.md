@@ -158,3 +158,36 @@ question, and it is the next experiment.
 This is exactly what a real measurement buys over a theoretical estimate: the probe
 predicted "won't fit"; the benchmark showed "won't load, for an unrelated reason, in
 217 ms".
+
+## The probe is too conservative, and the measurement proved it
+
+Following the wrong-variant discovery, the **generic** `gemma-4-E2B-it.litertlm` (2.4 GB)
+was pushed and benchmarked. It **loaded and ran**, on CPU, with no low-memory kill
+anywhere in logcat — even though the same screen labelled it
+*"Acima do orçamento medido (1,5 GB)"*.
+
+| Model | Size | Load | First token | Speed (ceiling) | Probe said | Reality |
+|---|---|---|---|---|---|---|
+| `mobile-actions_q8_ekv1024` | 271 MB | 290 ms | 1.6 s | **78.8 tok/s** | fits | ran |
+| `gemma-4-E2B-it` (generic) | **2.4 GB** | **3.1 s** | **947 ms** | **35.5 tok/s** | **does not fit** | **ran** |
+| `gemma-4-E2B-it-gpu` | 1.9 GB | 217 ms | — | — | does not fit | failed: no CPU section |
+
+**The probe's model of memory is wrong, and the UI already says why:** weights are a
+memory-mapped file, so the OS pages them in on demand instead of requiring the whole
+thing resident. `DeviceCapability` compares the file size against half the measured
+headroom, which is a sound *safety* heuristic and a bad *feasibility* predictor.
+
+The honest conclusion is to keep the probe as a warning and let the benchmark be the
+verdict — which is the arrangement that now exists. What must NOT happen is the probe
+silently preventing a model from being tried; that is why the override was added.
+
+Speed, as expected, scales inversely with size: 78.8 tok/s at 271 MB against 35.5 tok/s
+at 2.4 GB, both on CPU. Note 35.5 tok/s is still comfortably interactive.
+
+### Consequence not yet addressed
+
+The reduced three-tool set is chosen by **mode** (`ModelMode.ON_DEVICE`), not by the
+model's context window. That was right for `ekv1024` at 1024 tokens. But the Gemma
+bundles are general models with far larger windows, so they are almost certainly being
+denied tools they could hold. The choice should follow the model's actual window (or be
+measured), not the fact that inference happens on the phone.
