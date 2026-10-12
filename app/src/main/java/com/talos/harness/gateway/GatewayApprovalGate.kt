@@ -20,10 +20,16 @@ import kotlinx.coroutines.CompletableDeferred
  * slot. A single slot would strand the earlier caller forever, because a second
  * [request] would overwrite the deferred that [submit] and [cancel] reach.
  *
+ * The ids a decision must be POSTed with are read off the frame that raised the
+ * prompt and travel *inside* that prompt's entry: [forFrame] captures them while
+ * the frame is being handled, and [request] carries them into the coroutine that
+ * parks the prompt. They are never read back from fields that a later frame
+ * could overwrite, so a prompt can never be answered with another request's ids.
+ *
  * The app still shows one dialog at a time, and prompts are published in the
  * order they arrived, so [submit] answers the oldest — FIFO is the honest
- * behaviour for a one-dialog UI. [submitFor] targets one specific
- * `request_id` for a caller that already knows which prompt it is deciding.
+ * behaviour for a one-dialog UI. [submitFor] targets one specific `request_id`
+ * for a caller that already knows which prompt it is deciding.
  *
  * Unlike the local gate this is *not* consulted against the on-device
  * allowlist. The allowlist is about tools this phone runs; a prompt from the
@@ -40,10 +46,10 @@ class GatewayApprovalGate(
     /**
      * One parked prompt together with the ids read off the frame that raised it.
      *
-     * The ids are kept per entry, not only in the [runId]/[requestId]/[choices]
-     * scalars below: with several prompts in flight those scalars describe the
-     * frame that arrived *last*, while the decision POST must carry the ids of
-     * the prompt the user was actually shown.
+     * The ids are kept per entry, not in gate-wide fields: with several prompts
+     * in flight a shared field would describe the frame that arrived *last*,
+     * while the decision POST must carry the ids of the prompt the user was
+     * actually shown.
      */
     data class Parked(
         val request: ApprovalRequest,
@@ -52,13 +58,32 @@ class GatewayApprovalGate(
         val choices: List<String>,
     )
 
+    /**
+     * The ids one `approval.request` frame carried, bound to that frame.
+     *
+     * Built by [forFrame] on the thread that reads the frame and handed back to
+     * [request] from the coroutine that parks the prompt. Because the value is
+     * carried, a second frame read before that coroutine runs cannot change the
+     * ids this prompt will be answered with.
+     *
+     * [cancelEpoch] is the state of the gate-wide cancel when the frame was
+     * read. A prompt whose frame predates a [cancel] must not park on a
+     * response that already happened — see [request].
+     */
+    class Frame internal constructor(
+        internal val runId: String?,
+        internal val requestId: String?,
+        internal val choices: List<String>,
+        internal val cancelEpoch: Int,
+    )
+
     private class Slot(
         val key: String,
         val parked: Parked,
         val deferred: CompletableDeferred<ApprovalDecision> = CompletableDeferred(),
     )
 
-    /** Guards [parked] and [displayed]; callbacks are always fired outside it. */
+    /** Guards [parked], [displayed], [settledEarly] and [cancelEpoch]. */
     private val lock = Any()
 
     /**
@@ -73,47 +98,34 @@ class GatewayApprovalGate(
     private var displayed: String? = null
 
     /**
-     * Run id of the most recently [attach]ed frame; null when no desktop prompt
-     * is known.
+     * `request_id`s the gateway settled *before* their prompt registered.
      *
-     * Kept for callers that only care about the latest frame. Prefer [oldest]
-     * when answering a prompt, because this scalar is overwritten by every
-     * later frame even while an earlier prompt is still on screen.
+     * An `approval.responded` frame is handled on the callback thread while the
+     * prompt's registration runs in a coroutine, so the response can be read
+     * first. Without this memory the prompt would park afterwards and wait
+     * forever for an answer that already happened. Bounded because only the
+     * handful of frames that can race a registration matter.
      */
-    @Volatile
-    var runId: String? = null
-        private set
-
-    /** Which pending prompt on that run, when the gateway told us. */
-    @Volatile
-    var requestId: String? = null
-        private set
-
-    /** Choices the gateway advertised for the parked prompt, verbatim. */
-    @Volatile
-    var choices: List<String> = emptyList()
-        private set
+    private val settledEarly = LinkedHashSet<String>()
 
     /**
-     * Records the ids the frame carried, once they are known.
+     * Bumped by [cancel], which takes every parked prompt down at once.
      *
-     * [request] may be reached before the frame is parsed (the loop can park
-     * first), so the association is a separate, repeatable call rather than a
-     * constructor argument. [request] snapshots these values into its own
-     * entry, so a later frame does not rewrite an already-parked prompt's ids.
+     * Read through [forFrame] while a frame is handled, so a registration
+     * scheduled before a cancel can tell that it lost the race.
      */
-    fun attach(runId: String?, requestId: String?, choices: List<String> = emptyList()) {
-        this.runId = runId
-        this.requestId = requestId
-        this.choices = choices
-    }
+    @Volatile
+    private var cancelEpoch: Int = 0
 
-    /** Forgets the ids once the prompt is over, so a stale run is never answered. */
-    fun clear() {
-        runId = null
-        requestId = null
-        choices = emptyList()
-    }
+    /**
+     * Captures one `approval.request` frame's ids, together with the gate-wide
+     * cancel state at this moment.
+     *
+     * Call it on the frame callback, not inside the coroutine that parks the
+     * prompt: the point is to bind the ids to the prompt as the frame is read.
+     */
+    fun forFrame(runId: String?, requestId: String?, choices: List<String> = emptyList()): Frame =
+        Frame(runId, requestId, choices, cancelEpoch)
 
     /** The oldest prompt still waiting, with the ids needed to answer it. */
     val oldest: Parked?
@@ -125,21 +137,50 @@ class GatewayApprovalGate(
     val pendingCount: Int
         get() = synchronized(lock) { parked.values.count { !it.deferred.isCompleted } }
 
-    override suspend fun request(request: ApprovalRequest): ApprovalDecision {
-        // Snapshot the ids now: a frame that arrives while this prompt is
-        // parked would otherwise overwrite the scalars and mis-address the
-        // answer for this one.
-        val snapshot = Parked(request, runId, requestId, choices)
+    /**
+     * A prompt raised by the loop itself (a local tool in bridge mode).
+     *
+     * It has no gateway frame behind it, so it carries no run id and is answered
+     * locally: the decision resumes the loop's own coroutine instead of being
+     * POSTed anywhere.
+     */
+    override suspend fun request(request: ApprovalRequest): ApprovalDecision =
+        request(request, forFrame(runId = null, requestId = null))
+
+    /**
+     * Parks [request] together with the ids of the frame that raised it.
+     *
+     * [frame] must come from [forFrame] on the callback thread. The ids are
+     * copied into this prompt's own entry here and are never read from shared
+     * state again, so two prompts in flight are each answered with their own
+     * `run_id`/`request_id`/`choices`.
+     *
+     * If the response is already known — an `approval.responded` for this
+     * `request_id`, or a [cancel] that happened after the frame was read — the
+     * prompt is settled fail-closed ([ApprovalDecision.REJECT]) and never
+     * published, instead of parking and stranding the caller.
+     */
+    suspend fun request(request: ApprovalRequest, frame: Frame): ApprovalDecision {
+        val snapshot = Parked(request, frame.runId, frame.requestId, frame.choices)
         val slot = synchronized(lock) {
-            // request_id is the gateway's own key. Without one, the run id is
-            // the best grouping; a prompt with neither still gets a unique key
-            // from its own id so two of them cannot clobber each other.
-            val base = snapshot.requestId ?: snapshot.runId ?: request.id
-            var key = base
-            var suffix = 2
-            while (parked.containsKey(key)) key = "$base#${suffix++}"
-            Slot(key, snapshot).also { parked[key] = it }
+            val alreadySettled = frame.cancelEpoch < cancelEpoch ||
+                (frame.requestId != null && frame.requestId in settledEarly)
+            if (alreadySettled) {
+                null
+            } else {
+                // request_id is the gateway's own key. Without one, the run id is
+                // the best grouping; a prompt with neither still gets a unique key
+                // from its own id so two of them cannot clobber each other.
+                val base = frame.requestId ?: frame.runId ?: request.id
+                var key = base
+                var suffix = 2
+                while (parked.containsKey(key)) key = "$base#${suffix++}"
+                Slot(key, snapshot).also { parked[key] = it }
+            }
         }
+
+        if (slot == null) return ApprovalDecision.REJECT
+
         // Only the head of the queue reaches the dialog; the rest wait their turn.
         publishHead()
         return try {
@@ -158,17 +199,20 @@ class GatewayApprovalGate(
     }
 
     /**
-     * Answers the oldest parked prompt (FIFO). A no-op when nothing is waiting.
+     * Answers the oldest parked prompt (FIFO) and returns it, or null when
+     * nothing is waiting.
      *
      * The gate publishes prompts in arrival order, so the one on screen *is*
      * the oldest; answering in any other order would decide a prompt the user
-     * never saw.
+     * never saw. The entry is returned so the caller POSTs the ids of the prompt
+     * it actually settled — a frame answered in between must not let the
+     * decision carry the *next* prompt's ids.
      */
-    fun submit(decision: ApprovalDecision) {
-        val oldestSlot = synchronized(lock) {
-            parked.values.firstOrNull { !it.deferred.isCompleted }
-        } ?: return
+    fun submit(decision: ApprovalDecision): Parked? = synchronized(lock) {
+        val oldestSlot = parked.values.firstOrNull { !it.deferred.isCompleted }
+            ?: return@synchronized null
         oldestSlot.deferred.complete(decision)
+        oldestSlot.parked
     }
 
     /**
@@ -177,16 +221,23 @@ class GatewayApprovalGate(
      *
      * Falls back to matching the entry's key so a prompt parked without a
      * `request_id` (keyed by run id, or by its own id) can still be targeted.
-     * Returns false when no live prompt matches, i.e. the caller's answer has
-     * nothing to settle.
+     * Returns false when no live prompt matches; the id is then remembered so a
+     * prompt that registers afterwards fails closed instead of stranding.
      */
-    fun submitFor(requestId: String, decision: ApprovalDecision): Boolean {
-        val match = synchronized(lock) {
-            parked.values.firstOrNull {
-                (it.parked.requestId == requestId || it.key == requestId) && !it.deferred.isCompleted
+    fun submitFor(requestId: String, decision: ApprovalDecision): Boolean = synchronized(lock) {
+        val match = parked.values.firstOrNull {
+            (it.parked.requestId == requestId || it.key == requestId) && !it.deferred.isCompleted
+        }
+        if (match != null) {
+            match.deferred.complete(decision)
+            true
+        } else {
+            settledEarly += requestId
+            while (settledEarly.size > REMEMBERED_SETTLED_IDS) {
+                settledEarly.remove(settledEarly.first())
             }
-        } ?: return false
-        return match.deferred.complete(decision)
+            false
+        }
     }
 
     /**
@@ -199,7 +250,12 @@ class GatewayApprovalGate(
      * suspended forever when the turn is cancelled.
      */
     fun cancel() {
-        val all = synchronized(lock) { parked.values.toList() }
+        val all = synchronized(lock) {
+            // Registrations scheduled before this point must not park afterwards:
+            // their response is already known (see [Frame.cancelEpoch]).
+            cancelEpoch++
+            parked.values.toList()
+        }
         all.forEach { it.deferred.complete(ApprovalDecision.REJECT) }
     }
 
@@ -222,6 +278,11 @@ class GatewayApprovalGate(
             head.parked
         }
         if (next != null) onPending(next.request)
+    }
+
+    private companion object {
+        /** See [settledEarly]; a registration race is one dispatch wide. */
+        const val REMEMBERED_SETTLED_IDS = 32
     }
 }
 

@@ -485,7 +485,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         approvalDeferred = null
         // A parked remote prompt must not outlive the run that raised it.
         gatewayGate.cancel()
-        gatewayGate.clear()
         _state.update { it.copy(isRunning = false, pendingApproval = null) }
         persist(_state.value.conversation)
     }
@@ -495,23 +494,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      *
      * A prompt from the desktop is answered over HTTP — the desktop is the side
      * that is blocked — while a local tool call only needs its coroutine
-     * resumed. The gate publishes prompts FIFO, so the one on screen is
-     * [GatewayApprovalGate.oldest]; its own ids are used rather than the
-     * `attach` scalars, which a later frame may already have overwritten.
+     * resumed. The gate publishes prompts FIFO, so the one on screen is the
+     * oldest; [GatewayApprovalGate.submit] settles it and reports which entry
+     * that was, so the POST carries the ids of the prompt the user actually saw
+     * even if a frame answered a different prompt in between.
      */
     fun resolveApproval(decision: ApprovalDecision) {
         val request = _state.value.pendingApproval
-        val parked = gatewayGate.oldest
-        if (parked != null && parked.runId != null) {
-            val choice = gatewayChoiceFor(decision, parked.choices)
-            // submit() answers the oldest, which is exactly the parked entry read
-            // above, so the POST and the resumed coroutine agree on the prompt.
-            gatewayGate.submit(decision)
-            // Keep the frame ids while another prompt is still parked; its own
-            // entry carries what it needs, but a stale clear would be misleading.
-            if (gatewayGate.pendingCount == 0) gatewayGate.clear()
-            _state.update { it.copy(pendingApproval = null) }
-            viewModelScope.launch { postDecision(parked.runId, parked.requestId, choice) }
+        val answered = gatewayGate.submit(decision)
+        if (answered?.runId != null) {
+            val choice = gatewayChoiceFor(decision, answered.choices)
+            // The dialog is not cleared here on purpose. Completing the parked
+            // deferred can resume its coroutine inline on the main thread, whose
+            // onSettled/onPending may already have published the *next* prompt;
+            // clearing `pendingApproval` now would wipe that one off the screen
+            // and leave it parked with nothing to answer. onSettled clears the
+            // entry that was actually answered.
+            viewModelScope.launch { postDecision(answered.runId, answered.requestId, choice) }
             return
         }
 
@@ -519,8 +518,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             viewModelScope.launch { settingsRepo.approveAlways(request.toolName) }
         }
         approvalDeferred?.complete(decision)
-        // The bridge-mode gate parks local tools too; a no-op in the other mode.
-        gatewayGate.submit(decision)
+        // A prompt a local tool parked on the bridge gate was settled by the
+        // submit() above; that is the only other thing it needed.
     }
 
     /**
@@ -528,14 +527,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      *
      * `approval.request` is the whole point of this feature: the desktop agent
      * has paused and is waiting for a decision, so the prompt is published
-     * through [gatewayGate] (same dialog as any other approval) and the ids the
-     * answer needs are attached to it. `approval.responded` means the prompt is
-     * already gone — answered elsewhere or expired — so ours is taken down.
+     * through [gatewayGate] (same dialog as any other approval) together with the
+     * ids its answer needs. Those ids are read off *this* frame and carried into
+     * the coroutine that parks the prompt, so they cannot be separated from it by
+     * a second frame. `approval.responded` means the prompt is already gone —
+     * answered elsewhere or expired — so ours is taken down; the gate remembers
+     * the id, so a prompt that registers after that frame fails closed instead of
+     * stranding.
      */
     private fun onGatewayFrame(event: StreamEvent) {
         when (event) {
             is StreamEvent.GatewayApprovalRequested -> {
-                gatewayGate.attach(event.runId, event.requestId, event.choices)
                 // Only the advertised decisions become buttons; an unknown choice
                 // maps to null and is dropped rather than rendered as nothing.
                 val offered = event.choices
@@ -543,20 +545,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     .distinct()
                     .ifEmpty { listOf(ApprovalDecision.APPROVE_ONCE, ApprovalDecision.REJECT) }
 
-                viewModelScope.launch {
-                    gatewayGate.request(
-                        ApprovalRequest(
-                            id = event.requestId ?: newId(),
-                            toolName = "ação no computador",
-                            arguments = event.command,
-                            preview = event.command.ifBlank { "O PC pediu permissão para continuar." },
-                            // The desktop's policy decided to ask; we cannot know
-                            // how risky it is, and the safe default is "look".
-                            risk = Risk.CAUTION,
-                            choices = offered,
-                        ),
-                    )
-                }
+                // Captured on the frame callback, before any coroutine runs: the
+                // ids and the prompt become one value, so a second
+                // `approval.request` read before this launch is dispatched cannot
+                // re-point the answer to this one.
+                val frame = gatewayGate.forFrame(event.runId, event.requestId, event.choices)
+                val request = ApprovalRequest(
+                    id = event.requestId ?: newId(),
+                    toolName = "ação no computador",
+                    arguments = event.command,
+                    preview = event.command.ifBlank { "O PC pediu permissão para continuar." },
+                    // The desktop's policy decided to ask; we cannot know
+                    // how risky it is, and the safe default is "look".
+                    risk = Risk.CAUTION,
+                    choices = offered,
+                )
+
+                viewModelScope.launch { gatewayGate.request(request, frame) }
             }
 
             is StreamEvent.GatewayApprovalResolved -> {
@@ -571,7 +576,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     // went away: take the whole queue down rather than leave a
                     // dialog up for something already settled.
                     gatewayGate.cancel()
-                    gatewayGate.clear()
                     _state.update { it.copy(pendingApproval = null) }
                 }
             }

@@ -44,6 +44,8 @@ import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import java.io.File
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
 /** A load or generation failure whose message is already user-facing (Portuguese). */
 class LocalModelException(message: String, cause: Throwable? = null) : Exception(message, cause)
@@ -189,6 +191,10 @@ class OnDeviceBackend(
      * and cancelling mid-generation leaves that state inconsistent
      * (b/450903294: there is no rollback yet). Fresh conversations sidestep both,
      * and a cancelled turn simply throws the conversation away.
+     *
+     * The native stream is collected under a stall window: see
+     * [collectWithStall] and [STALL_TIMEOUT]. A hung native call therefore ends
+     * as [StreamEvent.Failed], not as a turn that stays active forever.
      */
     override fun streamChat(
         apiKey: String,
@@ -269,43 +275,63 @@ class OnDeviceBackend(
             var toolCallIndex = 0
             try {
                 conversation = active.createConversation(config)
-                conversation.sendMessageAsync(currentMessage).collect { message ->
-                    val text = message.contents.contents
-                        .filterIsInstance<Content.Text>()
-                        .joinToString(separator = "") { it.text }
-                    val channels = message.channels.filterValues { it.isNotEmpty() }
+                // The native Flow only completes on `onDone`/`onError`. When
+                // neither ever arrives the collection would hang forever with
+                // the turn still active, so it is bounded by a *stall* window:
+                // silence for the whole window means the native side stopped
+                // answering, while a slow generation that keeps emitting is
+                // unaffected. The window is generous against the measured
+                // time-to-first-token on this device (947 ms for the 2.4 GB
+                // model, 1.6 s for the 271 MB one).
+                val stalled = conversation.sendMessageAsync(currentMessage)
+                    .collectWithStall(STALL_TIMEOUT) { message ->
+                        val text = message.contents.contents
+                            .filterIsInstance<Content.Text>()
+                            .joinToString(separator = "") { it.text }
+                        val channels = message.channels.filterValues { it.isNotEmpty() }
 
-                    // Reasoning first: a thinking model produces it before the
-                    // answer, and the UI renders events in arrival order.
-                    for ((name, value) in channels) {
-                        if (isReasoningChannel(name)) emit(StreamEvent.Reasoning(value))
+                        // Reasoning first: a thinking model produces it before the
+                        // answer, and the UI renders events in arrival order.
+                        for ((name, value) in channels) {
+                            if (isReasoningChannel(name)) emit(StreamEvent.Reasoning(value))
+                        }
+
+                        if (text.isNotEmpty()) emit(StreamEvent.Content(text))
+
+                        for ((name, value) in channels) {
+                            if (isReasoningChannel(name)) continue
+                            // Some templates echo a channel's text into `content` as
+                            // well; emitting both would duplicate it in the transcript.
+                            if (text.isNotEmpty() && text.contains(value)) continue
+                            emit(StreamEvent.Content(value))
+                        }
+
+                        // LiteRT-LM does not stream tool calls token by token: it
+                        // delivers one Message whose arguments are already parsed.
+                        // The loop accumulates (index, id, name, argsFragment), so
+                        // each call is emitted whole, with a unique index and no id
+                        // — the loop invents `call_$index` for a null id.
+                        for (call in message.toolCalls) {
+                            emit(
+                                StreamEvent.ToolCallDelta(
+                                    index = toolCallIndex++,
+                                    id = null,
+                                    name = call.name,
+                                    argsFragment = call.arguments.toJsonObject().toString(),
+                                ),
+                            )
+                        }
                     }
 
-                    if (text.isNotEmpty()) emit(StreamEvent.Content(text))
-
-                    for ((name, value) in channels) {
-                        if (isReasoningChannel(name)) continue
-                        // Some templates echo a channel's text into `content` as
-                        // well; emitting both would duplicate it in the transcript.
-                        if (text.isNotEmpty() && text.contains(value)) continue
-                        emit(StreamEvent.Content(value))
-                    }
-
-                    // LiteRT-LM does not stream tool calls token by token: it
-                    // delivers one Message whose arguments are already parsed.
-                    // The loop accumulates (index, id, name, argsFragment), so
-                    // each call is emitted whole, with a unique index and no id
-                    // — the loop invents `call_$index` for a null id.
-                    for (call in message.toolCalls) {
-                        emit(
-                            StreamEvent.ToolCallDelta(
-                                index = toolCallIndex++,
-                                id = null,
-                                name = call.name,
-                                argsFragment = call.arguments.toJsonObject().toString(),
-                            ),
-                        )
-                    }
+                if (stalled) {
+                    // The decode is still parked inside the native call, so stop
+                    // it before the conversation is closed, exactly like the
+                    // cancellation path below. This path must not fall through
+                    // to `Finished`: the turn failed, and a `Finished` after a
+                    // `Failed` would report a completion that never happened.
+                    runCatching { conversation.cancelProcess() }
+                    emit(StreamEvent.Failed(STALL_MESSAGE))
+                    return@withLock
                 }
 
                 // The only token count LiteRT-LM exposes is the KV-cache
@@ -418,6 +444,19 @@ class OnDeviceBackend(
         const val DEFAULT_TOP_P = 0.95
 
         const val LOAD_FAILED_MESSAGE = "Não foi possível carregar o modelo local."
+
+        /**
+         * How long the native stream may be silent before the turn is given up.
+         *
+         * Deliberately far above any healthy generation: the measured
+         * time-to-first-token on this device is 947 ms for the 2.4 GB model and
+         * 1.6 s for the 271 MB one, and the gap between later tokens is smaller
+         * still. Only a native call that never answers comes anywhere near it.
+         */
+        val STALL_TIMEOUT: Duration = 60.seconds
+
+        const val STALL_MESSAGE =
+            "O modelo no celular parou de responder e esta resposta foi abandonada. Tente de novo."
     }
 }
 
