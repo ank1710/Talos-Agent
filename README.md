@@ -165,13 +165,17 @@ Ordered by how much they matter.
   phone's. Two things had to be right: the URL/model/key swap, and the credential
   split (`apiKey` vs `gatewayApiKey`). Note the feature depends on the desktop
   gateway and `adb reverse` both being up; the drawer chip switches back.
-- **Remote PC approvals are NOT built — but they are now known to be possible.**
-  The gateway supports them fully, verified live: an `approval.request` SSE event
-  on the stream the app already consumes, and `POST /v1/runs/{run_id}/approval` to
-  answer it. See [docs/remote-approvals.md](docs/remote-approvals.md) for the wire
-  shapes, the endpoint, and the one parser trap that will otherwise make the first
-  attempt fail silently. `ApprovalGate` is the seam: a gateway-backed gate is a
-  second implementation, with no changes to `AgentLoop`.
+- **Remote PC approvals are built and verified end to end.** The desktop agent
+  pauses, `approval.request` reaches the phone over the SSE stream the app already
+  consumes, the dialog offers only the choices the event advertises, and the
+  decision POSTs back to `/v1/runs/{run_id}/approval` — confirmed by the protected
+  file appearing on the Mac afterwards. See
+  [docs/remote-approvals.md](docs/remote-approvals.md), which also keeps the record
+  of the first attempt that *looked* successful without ever tripping the gate.
+  Concurrency, `all: true` and a live `approval.responded` frame remain unverified.
+- **SAF is not built.** Calendar read, contacts search, intents and shell cover the
+  rest of the "deep Android integration" scope; only the Storage Access Framework
+  document picker is missing.
 - **Calendar read and contacts search are done. SAF is not.** Both follow the
   same permission contract: with the permission missing they return an error
   naming the exact permission to grant, never a silent no-op.
