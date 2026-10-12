@@ -191,3 +191,32 @@ model's context window. That was right for `ekv1024` at 1024 tokens. But the Gem
 bundles are general models with far larger windows, so they are almost certainly being
 denied tools they could hold. The choice should follow the model's actual window (or be
 measured), not the fact that inference happens on the phone.
+
+## The full toolset works offline, on the large model
+
+Sending the whole 13-tool catalogue on-device was gated by MODE rather than by the
+model, which was right for the 1024-token bundle and wrong for everything else. It is
+now gated by the context window the bundle declares (`ekv<N>` in the filename), with
+`null` meaning "not declared" and therefore "assume there is room": a model that is too
+small fails loudly with both numbers, whereas a model that had room and was handed a
+crippled toolset just quietly underperforms, and that second mistake is invisible.
+
+**Verified on device**, with `gemma-4-E2B-it.litertlm` (2.4 GB) selected:
+
+> User: *O que tem na minha área de trabalho?*
+> Tool: `list_dir` — 23 ms — `/data/user/0/com.talos.harness.debug/files/workspace (0 entradas)`
+> Answer: *Não há arquivos na sua área de trabalho.*
+> Usage: `total 2488 tokens`
+
+Two things are established by that run:
+
+1. **`list_dir` is in the full catalogue only**, so the large model was in fact given all
+   13 tools and the window-based rule fired as intended.
+2. **`total 2488 tokens`** — more than double the 1024 that killed the small bundle, so
+   the Gemma's window is far larger than the 1024 that was previously assumed for every
+   on-device model.
+
+So the complete agent — all 13 tools, no network, no API key — runs on this phone. The
+Gemma also picked the right tool unprompted, which answers the separate open question of
+whether a general model (as opposed to FunctionGemma, the tool specialist) can drive the
+catalogue: at least on this task, it can.

@@ -198,6 +198,41 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val toolContext = ToolContext(app, workspace)
 
     /**
+     * The context window below which describing the whole tool catalogue is not
+     * affordable.
+     *
+     * Describing all 13 tools costs roughly 2190 tokens before the conversation
+     * starts (measured: a run died at 2184 against a 1024-token window), and the
+     * system prompt takes a few hundred more. 4096 leaves room for both plus a
+     * real exchange, so anything smaller gets the curated set instead.
+     */
+    private val FULL_TOOLSET_MIN_WINDOW = 4096
+
+    /**
+     * The context window a bundle declares, or null when it declares none.
+     *
+     * LiteRT-LM bundles carry no explicit context-length field - reading the
+     * header of the 2.4 GB Gemma shows the chat template and the
+     * `tf_lite_prefill_decode` section but no window size. The one signal that
+     * exists is the `ekv<N>` in the filename, which is how the small tool model is
+     * published (`mobile-actions_q8_ekv1024.litertlm`). It is worth trusting
+     * because it matches observation: that bundle failed at exactly 1024 tokens.
+     *
+     * null means "not declared", and the caller then assumes there IS room. That is
+     * the deliberate direction to fail in: a model that is too small says so
+     * loudly, with a token-count error naming both numbers, whereas a model that
+     * had room and was handed a crippled toolset just quietly underperforms - and
+     * the second mistake is invisible.
+     */
+    private fun declaredContextWindow(model: String): Int? =
+        Regex("""ekv(\d+)""", RegexOption.IGNORE_CASE)
+            .find(model)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.takeIf { it > 0 }
+
+    /**
      * The registry for the agent the user talks to (depth 0).
      *
      * It is built through [buildTools] rather than listed here, and a fresh one is
@@ -247,14 +282,25 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         //     state, which is what makes the separate file tools redundant here.
         //   - notify: how the agent reports back when the app is not on screen.
         val onDevice = settings.mode == ModelMode.ON_DEVICE
+
+        // Whether this run can afford to DESCRIBE the whole catalogue.
+        //
+        // The limit is the model's context window, not the fact that inference
+        // happens on the phone. That distinction matters: the small tool model here
+        // holds 1024 tokens, but the Gemma bundles sit in the gigabytes with windows
+        // to match, and denying them tools they can hold makes the agent weaker for
+        // no reason. Measured on device: the 2.4 GB Gemma loads and runs at 35 tok/s,
+        // so "on-device" is not the same as "small".
+        val roomForEverything = !onDevice || declaredContextWindow(settings.model)
+            ?.let { it >= FULL_TOOLSET_MIN_WINDOW } ?: true
+
         val tools = mutableListOf<Tool>().apply {
             add(DeviceInfoTool())
             add(ShellTool())
             add(NotifyTool())
 
-            if (!onDevice) {
-                // Everything else needs room to be described, and only cloud and
-                // desktop runs have it.
+            if (roomForEverything) {
+                // Everything else needs room to be described.
                 add(ReadFileTool())
                 add(WriteFileTool())
                 add(ListDirTool())
@@ -270,9 +316,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        // Subagents are excluded on-device for the same reason: the spawner's own
-        // schema is large, and a child would spend the token budget twice.
-        if (!onDevice && depth < SpawnSubagentTool.MAX_DEPTH) {
+        // Subagents cost tokens twice over - the spawner's own schema, then the
+        // child's whole run - so they need the same room as the full catalogue.
+        if (roomForEverything && depth < SpawnSubagentTool.MAX_DEPTH) {
             tools += SpawnSubagentTool(
                 depth = depth,
                 backend = backend,
