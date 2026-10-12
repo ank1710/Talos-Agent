@@ -38,6 +38,8 @@ import com.talos.harness.schedule.ScheduledTaskStore
 import com.talos.harness.store.ConversationStore
 import com.talos.harness.store.ConversationSummary
 import com.talos.harness.store.ModelMode
+import com.talos.harness.store.ProviderCatalog
+import com.talos.harness.store.ProviderModel
 import com.talos.harness.store.TalosSettings
 import com.talos.harness.store.SettingsRepository
 import com.talos.harness.tools.CalendarReadTool
@@ -77,7 +79,7 @@ data class ChatUiState(
     val pendingApproval: ApprovalRequest? = null,
     val usage: WireUsage? = null,
     val error: String? = null,
-    val availableModels: List<String> = emptyList(),
+    val availableModels: List<ProviderModel> = emptyList(),
     val isBusy: Boolean = false,
     val statusMessage: String? = null,
     val statusIsError: Boolean = false,
@@ -194,6 +196,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
     private var runJob: Job? = null
+    private var modelFetchJob: Job? = null
     private var approvalDeferred: CompletableDeferred<ApprovalDecision>? = null
 
     /** Mirrors the persisted allowlist so the gate can answer without I/O. */
@@ -603,9 +606,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
         runJob = viewModelScope.launch {
             val loop = AgentLoop(
-                // The cloud client stays the default: CLOUD and DESKTOP keep the
-                // exact backend they had, and only ON_DEVICE swaps it.
-                client = if (local) onDeviceEngine else client,
+                // CLOUD and DESKTOP bind the selected provider's auth to this turn;
+                // only ON_DEVICE swaps out the remote client entirely.
+                client = if (local) onDeviceEngine else client.forProvider(settings.provider),
                 registry = registry,
                 // Against the desktop, prompts come from its policy rather than
                 // from this phone's allowlist, so the gateway gate answers them.
@@ -811,6 +814,38 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateBaseUrl(value: String) = viewModelScope.launch { settingsRepo.setBaseUrl(value) }
 
+    /** Saves one provider, switches to its known URL, then refreshes its model list. */
+    fun selectProvider(providerId: String) {
+        val current = _state.value.settings
+        val provider = ProviderCatalog.byId(providerId) ?: ProviderCatalog.CUSTOM
+        val modelOverride = provider.defaultModel.takeIf { current.mode != ModelMode.ON_DEVICE }
+        val selected = current.copy(
+            providerId = provider.id,
+            baseUrl = provider.baseUrl ?: current.baseUrl,
+            model = modelOverride ?: current.model,
+        )
+        viewModelScope.launch {
+            settingsRepo.selectProvider(provider.id, modelOverride = modelOverride)
+            fetchModels(selected)
+        }
+    }
+
+    /** The settings shortcut keeps the existing gateway mode detection and key split. */
+    fun useLocalGateway() {
+        val current = _state.value.settings
+        val selected = current.copy(
+            providerId = ProviderCatalog.CUSTOM.id,
+            baseUrl = TalosSettings.LOCAL_GATEWAY_BASE_URL,
+        )
+        viewModelScope.launch {
+            settingsRepo.selectProvider(
+                providerId = ProviderCatalog.CUSTOM.id,
+                baseUrlOverride = TalosSettings.LOCAL_GATEWAY_BASE_URL,
+            )
+            fetchModels(selected)
+        }
+    }
+
     fun updateModel(value: String) = viewModelScope.launch { settingsRepo.setModel(value) }
 
     fun updateTemperature(value: Double) = viewModelScope.launch { settingsRepo.setTemperature(value) }
@@ -850,8 +885,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun useDesktopBridge() {
         viewModelScope.launch {
             settingsRepo.setMode(ModelMode.DESKTOP)
-            settingsRepo.setBaseUrl(TalosSettings.LOCAL_GATEWAY_BASE_URL)
-            settingsRepo.setModel(TalosSettings.GATEWAY_MODEL)
+            settingsRepo.selectProvider(
+                providerId = ProviderCatalog.CUSTOM.id,
+                baseUrlOverride = TalosSettings.LOCAL_GATEWAY_BASE_URL,
+                modelOverride = TalosSettings.GATEWAY_MODEL,
+            )
             _state.update { it.copy(statusMessage = "Rodando no PC.", statusIsError = false) }
         }
     }
@@ -860,8 +898,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun useCloud() {
         viewModelScope.launch {
             settingsRepo.setMode(ModelMode.CLOUD)
-            settingsRepo.setBaseUrl(TalosSettings.DEFAULT_BASE_URL)
-            settingsRepo.setModel(TalosSettings.DEFAULT_MODEL)
+            settingsRepo.selectProvider(
+                providerId = ProviderCatalog.DEEPSEEK.id,
+                modelOverride = TalosSettings.DEFAULT_MODEL,
+            )
             _state.update { it.copy(statusMessage = "Rodando na nuvem.", statusIsError = false) }
         }
     }
@@ -908,10 +948,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun clearApprovals() = viewModelScope.launch { settingsRepo.clearApprovals() }
 
     fun fetchModels() {
-        val settings = _state.value.settings
-        viewModelScope.launch {
-            _state.update { it.copy(isBusy = true, statusMessage = null) }
-            val models = client.listModels(settings.apiKey, settings.baseUrl)
+        fetchModels(_state.value.settings)
+    }
+
+    private fun fetchModels(settings: TalosSettings) {
+        modelFetchJob?.cancel()
+        _state.update {
+            it.copy(isBusy = true, availableModels = emptyList(), statusMessage = null, statusIsError = false)
+        }
+        if (settings.provider.requiresApiKeyForModels && settings.effectiveApiKey.isBlank()) {
+            _state.update {
+                it.copy(
+                    isBusy = false,
+                    statusMessage = "Informe uma chave de API para buscar modelos de ${settings.provider.displayName}.",
+                    statusIsError = true,
+                )
+            }
+            return
+        }
+        modelFetchJob = viewModelScope.launch {
+            val models = client.listModels(
+                apiKey = settings.effectiveApiKey,
+                baseUrl = settings.baseUrl,
+                provider = settings.provider,
+            )
             _state.update {
                 it.copy(
                     isBusy = false,
@@ -930,8 +990,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun testConnection() {
         val settings = _state.value.settings
         viewModelScope.launch {
+            if (settings.provider.requiresApiKeyForModels && settings.effectiveApiKey.isBlank()) {
+                _state.update {
+                    it.copy(
+                        isBusy = false,
+                        statusMessage = "Informe uma chave de API para testar ${settings.provider.displayName}.",
+                        statusIsError = true,
+                    )
+                }
+                return@launch
+            }
             _state.update { it.copy(isBusy = true, statusMessage = "Testando conexão…", statusIsError = false) }
-            val failure = client.probe(settings.apiKey, settings.baseUrl)
+            val failure = client.probe(settings.effectiveApiKey, settings.baseUrl, settings.provider)
             _state.update {
                 it.copy(
                     isBusy = false,

@@ -174,7 +174,7 @@ class ScheduledAgentWorker(
         val workspace = File(applicationContext.filesDir, "workspace").apply { mkdirs() }
 
         val loop = AgentLoop(
-            client = client,
+            client = client.forProvider(settings.provider),
             registry = toolRegistry(),
             approvals = UnattendedApprovalGate(allowSensitiveTools = task.allowSensitiveTools),
             toolContext = ToolContext(applicationContext, workspace),

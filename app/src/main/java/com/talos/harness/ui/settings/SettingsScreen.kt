@@ -1,7 +1,6 @@
 package com.talos.harness.ui.settings
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,8 +19,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -50,6 +50,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.talos.harness.store.ProviderCatalog
+import com.talos.harness.store.ProviderModel
 import com.talos.harness.store.TalosSettings
 import com.talos.harness.ui.theme.TalosColors
 import java.util.Locale
@@ -60,12 +62,11 @@ import java.util.Locale
  * Renders purely from [settings]: every edit is pushed straight up through the
  * `on*Change` callbacks and comes back down as a new [settings] value, so the
  * screen never holds a second copy of persisted state that could drift from the
- * store. The only local state is presentation-only (the API key mask toggle, the
- * chip-row scroll position).
+ * store. The only local state is presentation-only (the API key mask toggle and
+ * whether the provider or model dropdown is open).
  *
- * @param availableModels model ids discovered from the configured endpoint; an
- *   empty list is normal (offline, bad key) and only hides the shortcut chips —
- *   the free-text model field always stays usable.
+ * @param availableModels models discovered from the selected provider; an empty
+ *   list hides the dropdown while the free-text model field stays usable.
  * @param isBusy a network probe is in flight; both diagnostic actions are
  *   disabled and a spinner is shown next to them.
  * @param statusMessage result of the last probe, or `null` when there has been
@@ -76,12 +77,14 @@ import java.util.Locale
 @Composable
 fun SettingsScreen(
     settings: TalosSettings,
-    availableModels: List<String>,
+    availableModels: List<ProviderModel>,
     isBusy: Boolean,
     statusMessage: String?,
     statusIsError: Boolean,
     onApiKeyChange: (String) -> Unit,
+    onProviderChange: (String) -> Unit,
     onBaseUrlChange: (String) -> Unit,
+    onUseLocalGateway: () -> Unit,
     onGatewayApiKeyChange: (String) -> Unit,
     onModelChange: (String) -> Unit,
     onTemperatureChange: (Double) -> Unit,
@@ -122,7 +125,9 @@ fun SettingsScreen(
                 settings = settings,
                 availableModels = availableModels,
                 onApiKeyChange = onApiKeyChange,
+                onProviderChange = onProviderChange,
                 onBaseUrlChange = onBaseUrlChange,
+                onUseLocalGateway = onUseLocalGateway,
                 onGatewayApiKeyChange = onGatewayApiKeyChange,
                 onModelChange = onModelChange,
                 onTemperatureChange = onTemperatureChange,
@@ -156,9 +161,11 @@ fun SettingsScreen(
 @Composable
 private fun ConnectionSection(
     settings: TalosSettings,
-    availableModels: List<String>,
+    availableModels: List<ProviderModel>,
     onApiKeyChange: (String) -> Unit,
+    onProviderChange: (String) -> Unit,
     onBaseUrlChange: (String) -> Unit,
+    onUseLocalGateway: () -> Unit,
     onGatewayApiKeyChange: (String) -> Unit,
     onModelChange: (String) -> Unit,
     onTemperatureChange: (Double) -> Unit,
@@ -169,6 +176,8 @@ private fun ConnectionSection(
     // NOT rememberSaveable — a secret should not be re-exposed after process death.
     var apiKeyVisible by remember { mutableStateOf(false) }
     var gatewayKeyVisible by remember { mutableStateOf(false) }
+    var providerExpanded by remember { mutableStateOf(false) }
+    var modelsExpanded by remember(settings.providerId) { mutableStateOf(false) }
 
     SectionHeader(text = "Conexão")
 
@@ -201,6 +210,32 @@ private fun ConnectionSection(
 
     Spacer(modifier = Modifier.height(14.dp))
 
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = { providerExpanded = true },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Text(text = "Provedor: ${settings.provider.displayName}")
+        }
+        DropdownMenu(
+            expanded = providerExpanded,
+            onDismissRequest = { providerExpanded = false },
+        ) {
+            ProviderCatalog.all.forEach { provider ->
+                DropdownMenuItem(
+                    text = { Text(text = provider.displayName) },
+                    onClick = {
+                        providerExpanded = false
+                        onProviderChange(provider.id)
+                    },
+                )
+            }
+        }
+    }
+
+    Spacer(modifier = Modifier.height(14.dp))
+
     OutlinedTextField(
         value = settings.baseUrl,
         onValueChange = onBaseUrlChange,
@@ -213,16 +248,16 @@ private fun ConnectionSection(
 
     Spacer(modifier = Modifier.height(6.dp))
     Text(
-        text = "https://api.deepseek.com/v1 fala direto com a DeepSeek. Um gateway " +
-            "compatível com OpenAI rodando no PC (padrão " +
-            "${TalosSettings.LOCAL_GATEWAY_BASE_URL}) roteia as chamadas pelo " +
-            "agente do desktop.",
+        text = "O provedor selecionado preenche a URL, que continua editável para " +
+            "servidores personalizados. Um gateway compatível com OpenAI rodando " +
+            "no PC (padrão ${TalosSettings.LOCAL_GATEWAY_BASE_URL}) roteia as " +
+            "chamadas pelo agente do desktop.",
         style = MaterialTheme.typography.bodyMedium,
         color = palette.textFaint,
     )
     Spacer(modifier = Modifier.height(8.dp))
     SuggestionChip(
-        onClick = { onBaseUrlChange(TalosSettings.LOCAL_GATEWAY_BASE_URL) },
+        onClick = onUseLocalGateway,
         label = { Text(text = "Usar gateway local") },
     )
 
@@ -274,18 +309,39 @@ private fun ConnectionSection(
 
     if (availableModels.isNotEmpty()) {
         Spacer(modifier = Modifier.height(10.dp))
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            availableModels.forEach { model ->
-                FilterChip(
-                    selected = model == settings.model,
-                    onClick = { onModelChange(model) },
-                    label = { Text(text = model) },
-                )
+        val selectedModel = availableModels.firstOrNull { it.id == settings.model }
+        Box(modifier = Modifier.fillMaxWidth()) {
+            OutlinedButton(
+                onClick = { modelsExpanded = true },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text(text = "Modelos disponíveis: ${selectedModel?.name ?: "Escolher"}")
+            }
+            DropdownMenu(
+                expanded = modelsExpanded,
+                onDismissRequest = { modelsExpanded = false },
+            ) {
+                availableModels.forEach { model ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                Text(text = model.name)
+                                if (model.name != model.id) {
+                                    Text(
+                                        text = model.id,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TalosColors.current.textFaint,
+                                    )
+                                }
+                            }
+                        },
+                        onClick = {
+                            modelsExpanded = false
+                            onModelChange(model.id)
+                        },
+                    )
+                }
             }
         }
     }

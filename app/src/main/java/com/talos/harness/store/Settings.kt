@@ -27,13 +27,14 @@ enum class ModelMode { CLOUD, DESKTOP, ON_DEVICE }
 /**
  * Everything the harness needs to reach a model.
  *
- * [baseUrl] is what makes the same client work against DeepSeek's public API and
- * against a local Hermes Agent gateway (an OpenAI-compatible server on the
- * desktop) — only the URL and key change.
+ * [providerId] selects endpoint defaults and authentication; [baseUrl] remains
+ * editable so the same client can reach custom OpenAI-compatible servers such as
+ * the local Hermes Agent gateway.
  */
 data class TalosSettings(
     /** Which kind of model serves the conversation. See [ModelMode]. */
     val mode: ModelMode = ModelMode.CLOUD,
+    val providerId: String = ProviderCatalog.DEEPSEEK.id,
     val apiKey: String = "",
     val baseUrl: String = DEFAULT_BASE_URL,
     val model: String = DEFAULT_MODEL,
@@ -49,6 +50,9 @@ data class TalosSettings(
      */
     val gatewayApiKey: String = "",
 ) {
+    /** Provider behavior is derived from the persisted id, with safe legacy fallback. */
+    val provider: Provider get() = ProviderCatalog.byId(providerId) ?: ProviderCatalog.CUSTOM
+
     /**
      * True when calls are routed through the Talos gateway on the desktop.
      *
@@ -140,6 +144,7 @@ class SettingsRepository(private val context: Context) {
 
     private object Keys {
         val mode = stringPreferencesKey("model_mode")
+        val providerId = stringPreferencesKey("provider_id")
         val apiKey = stringPreferencesKey("api_key")
         val baseUrl = stringPreferencesKey("base_url")
         val model = stringPreferencesKey("model")
@@ -150,11 +155,15 @@ class SettingsRepository(private val context: Context) {
 
     val flow: Flow<TalosSettings> = context.settingsDataStore.data.map { prefs ->
         val baseUrl = prefs[Keys.baseUrl] ?: TalosSettings.DEFAULT_BASE_URL
+        val providerId = prefs[Keys.providerId]
+            ?.let { ProviderCatalog.byId(it)?.id }
+            ?: ProviderCatalog.forBaseUrl(baseUrl).id
         TalosSettings(
             // Not stored yet means this install predates ModelMode; derive it from
             // the URL that used to be the only switch.
             mode = TalosSettings.fromStored(prefs[Keys.mode])
                 ?: TalosSettings.inferMode(baseUrl),
+            providerId = providerId,
             apiKey = prefs[Keys.apiKey].orEmpty(),
             baseUrl = baseUrl,
             model = prefs[Keys.model] ?: TalosSettings.DEFAULT_MODEL,
@@ -173,6 +182,22 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setGatewayApiKey(value: String) = context.settingsDataStore.edit {
         it[Keys.gatewayApiKey] = value.trim()
+    }
+
+    /** Persists the provider and its known endpoint without altering model mode. */
+    suspend fun selectProvider(
+        providerId: String,
+        baseUrlOverride: String? = null,
+        modelOverride: String? = null,
+    ) = context.settingsDataStore.edit { prefs ->
+        val provider = ProviderCatalog.byId(providerId) ?: ProviderCatalog.CUSTOM
+        prefs[Keys.providerId] = provider.id
+        (baseUrlOverride ?: provider.baseUrl)?.let { url ->
+            prefs[Keys.baseUrl] = url.trim().ifBlank { TalosSettings.DEFAULT_BASE_URL }
+        }
+        modelOverride?.let { model ->
+            prefs[Keys.model] = model.trim().ifBlank { TalosSettings.DEFAULT_MODEL }
+        }
     }
 
     suspend fun setBaseUrl(value: String) = context.settingsDataStore.edit {

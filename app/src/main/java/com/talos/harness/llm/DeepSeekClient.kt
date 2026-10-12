@@ -1,6 +1,10 @@
 package com.talos.harness.llm
 
 import com.talos.harness.core.TalosJson
+import com.talos.harness.store.Provider
+import com.talos.harness.store.ProviderAuthStyle
+import com.talos.harness.store.ProviderCatalog
+import com.talos.harness.store.ProviderModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -22,7 +26,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
- * Talks to a DeepSeek (OpenAI-compatible) chat endpoint.
+ * Talks to an OpenAI-compatible chat endpoint using the selected provider's auth.
  *
  * Streaming reads the raw SSE body on the IO dispatcher and turns each
  * `data:` frame into a [StreamEvent]. Cancelling the collecting coroutine
@@ -30,6 +34,7 @@ import java.util.concurrent.TimeUnit
  */
 class DeepSeekClient(
     private val http: OkHttpClient = defaultHttpClient(),
+    private val provider: Provider = ProviderCatalog.DEEPSEEK,
 ) : ChatBackend {
 
     /**
@@ -52,7 +57,7 @@ class DeepSeekClient(
         val payload = TalosJson.encodeToString(ChatRequest.serializer(), request)
         val httpRequest = Request.Builder()
             .url("${baseUrl.trimEnd('/')}/chat/completions")
-            .header("Authorization", "Bearer $apiKey")
+            .applyProviderAuth(provider, apiKey)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .post(payload.toRequestBody(JSON_MEDIA))
@@ -171,27 +176,46 @@ class DeepSeekClient(
         }
     }
 
-    /** Best-effort model discovery so the settings screen can offer real choices. */
-    suspend fun listModels(apiKey: String, baseUrl: String): List<String> = withContext(Dispatchers.IO) {
+    /** Reuses the HTTP pool while binding authentication to one provider per turn. */
+    fun forProvider(value: Provider): DeepSeekClient = DeepSeekClient(http, value).also {
+        it.onGatewayEvent = onGatewayEvent
+    }
+
+    /** Best-effort model discovery so settings can show provider names and ids. */
+    suspend fun listModels(
+        apiKey: String,
+        baseUrl: String,
+        provider: Provider,
+    ): List<ProviderModel> = withContext(Dispatchers.IO) {
         val request = Request.Builder()
             .url("${baseUrl.trimEnd('/')}/models")
-            .header("Authorization", "Bearer $apiKey")
+            .applyProviderAuth(provider, apiKey)
             .get()
             .build()
         runCatching {
             http.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return@use emptyList()
                 val text = response.body.string()
-                TalosJson.decodeFromString(ModelsResponse.serializer(), text).data.map { it.id }
+                val data = (TalosJson.parseToJsonElement(text) as? JsonObject)?.get("data") as? JsonArray
+                data.orEmpty().mapNotNull { item ->
+                    val model = item as? JsonObject ?: return@mapNotNull null
+                    val id = (model["id"] as? JsonPrimitive)?.contentOrNull
+                        ?.takeIf(String::isNotBlank)
+                        ?: return@mapNotNull null
+                    val name = (model["name"] as? JsonPrimitive)?.contentOrNull
+                        ?.takeIf(String::isNotBlank)
+                        ?: id
+                    ProviderModel(id = id, name = name)
+                }.distinctBy(ProviderModel::id)
             }
         }.getOrDefault(emptyList())
     }
 
     /** Verifies a key with a cheap round trip; returns null when the key works. */
-    suspend fun probe(apiKey: String, baseUrl: String): String? = withContext(Dispatchers.IO) {
+    suspend fun probe(apiKey: String, baseUrl: String, provider: Provider): String? = withContext(Dispatchers.IO) {
         val request = Request.Builder()
             .url("${baseUrl.trimEnd('/')}/models")
-            .header("Authorization", "Bearer $apiKey")
+            .applyProviderAuth(provider, apiKey)
             .get()
             .build()
         try {
@@ -221,6 +245,18 @@ class DeepSeekClient(
             else -> "Falha HTTP $code."
         }
         return if (apiMessage.isNullOrBlank()) hint else "$hint ($apiMessage)"
+    }
+
+    /** Centralizes provider-specific header rules so UI and settings stay protocol-agnostic. */
+    private fun Request.Builder.applyProviderAuth(provider: Provider, apiKey: String): Request.Builder {
+        if (apiKey.isNotBlank()) {
+            when (provider.authStyle) {
+                ProviderAuthStyle.BEARER -> header("Authorization", "Bearer $apiKey")
+                ProviderAuthStyle.X_API_KEY -> header("x-api-key", apiKey)
+            }
+        }
+        provider.extraHeaders.forEach { (name, value) -> header(name, value) }
+        return this
     }
 
     companion object {
