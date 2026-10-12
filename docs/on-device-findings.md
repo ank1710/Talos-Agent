@@ -25,24 +25,38 @@ total RAM. Models pushed to `getExternalFilesDir("models")`.
   > Falha ao gerar resposta no modelo local: Status Code: 3. Message: Input token ids are
   > too long. Exceeding the maximum number of tokens allowed: 2184 >= 1024
 
-## The blocker: the tool model cannot host this agent
+## The blocker, and the fix that works
 
 `mobile-actions_q8_ekv1024.litertlm` is the only model here built for tool calling, and
-the `ekv1024` in its name is its context window: **1024 tokens**. Talos sends a system
-prompt plus the JSON Schema of **13 tools**, which tokenises to **~2190**. It does not fit,
-by more than 2x.
+the `ekv1024` in its name is its context window: **1024 tokens**. Talos sent a system
+prompt plus the JSON Schema of **13 tools**, which tokenises to **~2190**. It did not fit
+by more than 2x, and the run died with `Input token ids are too long ... 2184 >= 1024`.
 
-That is not a tuning problem. A tool-calling model with a 1k context cannot host a
-13-tool agent, and this model has **no larger-KV variant published** (checked
-`litert-community/functiongemma-270m-ft-mobile-actions` and the community mirrors: only
-`ekv1024` exists).
+**Fixed by sending fewer tools.** A local run now gets a curated set of three, chosen so
+one still covers a lot:
 
-What would actually fix it, in order of least work:
-1. **Ship a reduced toolset for on-device runs** — 3 or 4 tools tokenise to a few hundred
-   tokens and would fit. The agent would be less capable but would work.
-2. **A bigger-context tool model.** Gemma 4 E2B is the candidate, but see the RAM problem
-   below.
-3. **Wait for a FunctionGemma with a larger KV.**
+| Tool | Why it earns its tokens |
+|---|---|
+| `device_info` | structured device state, tiny schema |
+| `shell` | the general instrument — reaches files, apps and system state, which is what makes the separate file tools redundant |
+| `notify` | how the agent reports back when the app is not on screen |
+
+Subagents are excluded on-device too: the spawner's schema is large and a child would
+spend the budget twice. Cloud and desktop runs keep all 13 plus subagents.
+
+**Verified end to end on the device, offline, with no API key and no network:**
+
+> User: *Qual a bateria do aparelho?*
+> Tool: `device_info` — 31ms — `Bateria: 80% (parada), 30.9°C / Armazenamento: 45.6 GB livres de 238.2 GB`
+> Answer: *A bateria do aparelho é 80% (parada), com 30.9°C*
+
+Model → tool call → execution → result fed back → final answer, all inside the phone.
+The usage strip reads `entrada 0 · saída 0 · total 1024 tokens`, which is the KV-cache
+occupancy: LiteRT exposes no prompt/completion split, and 1024 is the window being full.
+
+The earlier conclusion stands — a tool-calling model with a 1k context cannot host a
+13-tool agent — but it *can* host a 3-tool one, and that turns out to be enough for the
+phone-shaped jobs.
 
 ## Open problems found this round
 

@@ -211,27 +211,45 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         settings: TalosSettings,
         approvals: ApprovalGate,
     ): ToolRegistry {
-        val tools = mutableListOf<Tool>(
-            // Filesystem and shell.
-            ShellTool(),
-            ReadFileTool(),
-            WriteFileTool(),
-            ListDirTool(),
-            // Device integration.
-            DeviceInfoTool(),
-            NotifyTool(),
-            ClipboardReadTool(),
-            ClipboardWriteTool(),
-            OpenUrlTool(),
-            ListAppsTool(),
-            CalendarReadTool(),
-            ContactsSearchTool(),
-            // Network. CAUTION: an unattended run must not be able to POST your
-            // data anywhere without you opting that task in.
-            FetchUrlTool(),
-        )
+        // Which tools this run may describe to the model.
+        //
+        // On-device models are small AND their context windows are small: the only
+        // tool-calling model available here holds 1024 tokens in total, while
+        // describing all 13 tools costs ~2190 before the conversation even starts.
+        // The run then dies with "Input token ids are too long" and the agent looks
+        // broken. So a local run gets a curated set rather than a truncated
+        // catalogue, and the three tools are chosen so one still covers a lot:
+        //   - device_info: structured device state, tiny schema
+        //   - shell: the general instrument. It reaches files, apps and system
+        //     state, which is what makes the separate file tools redundant here.
+        //   - notify: how the agent reports back when the app is not on screen.
+        val onDevice = settings.mode == ModelMode.ON_DEVICE
+        val tools = mutableListOf<Tool>().apply {
+            add(DeviceInfoTool())
+            add(ShellTool())
+            add(NotifyTool())
 
-        if (depth < SpawnSubagentTool.MAX_DEPTH) {
+            if (!onDevice) {
+                // Everything else needs room to be described, and only cloud and
+                // desktop runs have it.
+                add(ReadFileTool())
+                add(WriteFileTool())
+                add(ListDirTool())
+                add(ClipboardReadTool())
+                add(ClipboardWriteTool())
+                add(OpenUrlTool())
+                add(ListAppsTool())
+                add(CalendarReadTool())
+                add(ContactsSearchTool())
+                // Network. CAUTION: an unattended run must not be able to POST
+                // your data anywhere without you opting that task in.
+                add(FetchUrlTool())
+            }
+        }
+
+        // Subagents are excluded on-device for the same reason: the spawner's own
+        // schema is large, and a child would spend the token budget twice.
+        if (!onDevice && depth < SpawnSubagentTool.MAX_DEPTH) {
             tools += SpawnSubagentTool(
                 depth = depth,
                 backend = backend,
