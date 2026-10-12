@@ -873,9 +873,15 @@ private fun ApprovalDialog(request: ApprovalRequest, onDecision: (ApprovalDecisi
         Risk.CAUTION -> palette.caution
         Risk.SAFE -> palette.success
     }
+    // A remote gate advertises what it will accept; offering more would send a
+    // choice the server rejects. Null means unrestricted (the on-device path).
+    val offered = request.choices ?: ApprovalDecision.entries.toList()
 
     AlertDialog(
-        onDismissRequest = { onDecision(ApprovalDecision.REJECT) },
+        onDismissRequest = {
+            // Back/outside tap is a refusal — but only when refusal is allowed.
+            if (ApprovalDecision.REJECT in offered) onDecision(ApprovalDecision.REJECT)
+        },
         containerColor = palette.surfaceElevated,
         titleContentColor = palette.textPrimary,
         textContentColor = palette.textSecondary,
@@ -914,17 +920,23 @@ private fun ApprovalDialog(request: ApprovalRequest, onDecision: (ApprovalDecisi
             }
         },
         confirmButton = {
-            TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ONCE) }) {
-                Text("Permitir", color = palette.brand)
+            if (ApprovalDecision.APPROVE_ONCE in offered) {
+                TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ONCE) }) {
+                    Text("Permitir", color = palette.brand)
+                }
             }
         },
         dismissButton = {
             Row {
-                TextButton(onClick = { onDecision(ApprovalDecision.REJECT) }) {
-                    Text("Recusar", color = palette.danger)
+                if (ApprovalDecision.REJECT in offered) {
+                    TextButton(onClick = { onDecision(ApprovalDecision.REJECT) }) {
+                        Text("Recusar", color = palette.danger)
+                    }
                 }
-                TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ALWAYS) }) {
-                    Text("Sempre", color = palette.textSecondary)
+                if (ApprovalDecision.APPROVE_ALWAYS in offered) {
+                    TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ALWAYS) }) {
+                        Text("Sempre", color = palette.textSecondary)
+                    }
                 }
             }
         },

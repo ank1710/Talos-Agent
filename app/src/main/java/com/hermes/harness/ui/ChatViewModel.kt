@@ -13,9 +13,16 @@ import com.hermes.harness.agent.Attachment
 import com.hermes.harness.agent.ChatMessage
 import com.hermes.harness.agent.Conversation
 import com.hermes.harness.agent.MessageStatus
+import com.hermes.harness.agent.Risk
 import com.hermes.harness.agent.Role
 import com.hermes.harness.agent.SystemPrompt
+import com.hermes.harness.agent.newId
+import com.hermes.harness.gateway.GatewayApprovalClient
+import com.hermes.harness.gateway.GatewayApprovalGate
+import com.hermes.harness.gateway.decisionForGatewayChoice
+import com.hermes.harness.gateway.gatewayChoiceFor
 import com.hermes.harness.llm.DeepSeekClient
+import com.hermes.harness.llm.StreamEvent
 import com.hermes.harness.llm.WireUsage
 import com.hermes.harness.media.MediaResolver
 import com.hermes.harness.schedule.ScheduleScheduler
@@ -108,6 +115,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val voice = VoiceController(app)
     private val conversationStore = ConversationStore(app.filesDir)
     private val client = DeepSeekClient()
+    private val gatewayClient = GatewayApprovalClient()
 
     private val workspace = File(app.filesDir, "workspace").apply { mkdirs() }
     private val toolContext = ToolContext(app, workspace)
@@ -158,7 +166,37 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Gate used while the desktop gateway is the one running the agent.
+     *
+     * Two sources park on it and both end up in the same dialog:
+     *  - a local tool the phone itself runs while in bridge mode (the loop calls
+     *    [ApprovalGate.request] as usual), and
+     *  - a prompt the *desktop* agent raised, which arrives as an SSE control
+     *    frame and is fed in by [onGatewayFrame].
+     *
+     * It publishes the prompt through `onPending` exactly like [approvalGate]
+     * above, so `ChatScreen` needs no second dialog.
+     */
+    private val gatewayGate = GatewayApprovalGate(
+        onPending = { request -> _state.update { it.copy(pendingApproval = request) } },
+        onSettled = { request ->
+            _state.update { current ->
+                if (current.pendingApproval?.id == request.id) {
+                    current.copy(pendingApproval = null)
+                } else {
+                    current
+                }
+            }
+        },
+    )
+
     init {
+        // Gateway control frames carry no chat chunk and AgentLoop must not be
+        // touched to forward them, so the client this view model owns hands them
+        // over directly.
+        client.onGatewayEvent = ::onGatewayFrame
+
         viewModelScope.launch {
             settingsRepo.flow.collect { settings ->
                 autoApproved = settings.autoApprovedTools
@@ -239,16 +277,137 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         runJob = null
         approvalDeferred?.cancel()
         approvalDeferred = null
+        // A parked remote prompt must not outlive the run that raised it.
+        gatewayGate.cancel()
+        gatewayGate.clear()
         _state.update { it.copy(isRunning = false, pendingApproval = null) }
         persist(_state.value.conversation)
     }
 
+    /**
+     * Handles the user's answer to whatever prompt is on screen.
+     *
+     * A prompt from the desktop is answered over HTTP — the desktop is the side
+     * that is blocked — while a local tool call only needs its coroutine
+     * resumed. [GatewayApprovalGate.runId] tells the two apart.
+     */
     fun resolveApproval(decision: ApprovalDecision) {
         val request = _state.value.pendingApproval
+        val runId = gatewayGate.runId
+        if (runId != null) {
+            val choice = gatewayChoiceFor(decision, gatewayGate.choices)
+            val requestId = gatewayGate.requestId
+            gatewayGate.submit(decision)
+            gatewayGate.clear()
+            _state.update { it.copy(pendingApproval = null) }
+            viewModelScope.launch { postDecision(runId, requestId, choice) }
+            return
+        }
+
         if (decision == ApprovalDecision.APPROVE_ALWAYS && request != null) {
             viewModelScope.launch { settingsRepo.approveAlways(request.toolName) }
         }
         approvalDeferred?.complete(decision)
+        // The bridge-mode gate parks local tools too; a no-op in the other mode.
+        gatewayGate.submit(decision)
+    }
+
+    /**
+     * Wires a gateway frame into the approval UI.
+     *
+     * `approval.request` is the whole point of this feature: the desktop agent
+     * has paused and is waiting for a decision, so the prompt is published
+     * through [gatewayGate] (same dialog as any other approval) and the ids the
+     * answer needs are attached to it. `approval.responded` means the prompt is
+     * already gone — answered elsewhere or expired — so ours is taken down.
+     */
+    private fun onGatewayFrame(event: StreamEvent) {
+        when (event) {
+            is StreamEvent.GatewayApprovalRequested -> {
+                gatewayGate.attach(event.runId, event.requestId, event.choices)
+                // Only the advertised decisions become buttons; an unknown choice
+                // maps to null and is dropped rather than rendered as nothing.
+                val offered = event.choices
+                    .mapNotNull(::decisionForGatewayChoice)
+                    .distinct()
+                    .ifEmpty { listOf(ApprovalDecision.APPROVE_ONCE, ApprovalDecision.REJECT) }
+
+                viewModelScope.launch {
+                    gatewayGate.request(
+                        ApprovalRequest(
+                            id = event.requestId ?: newId(),
+                            toolName = "ação no computador",
+                            arguments = event.command,
+                            preview = event.command.ifBlank { "O PC pediu permissão para continuar." },
+                            // The desktop's policy decided to ask; we cannot know
+                            // how risky it is, and the safe default is "look".
+                            risk = Risk.CAUTION,
+                            choices = offered,
+                        ),
+                    )
+                }
+            }
+
+            is StreamEvent.GatewayApprovalResolved -> {
+                // Another prompt on the same run may be the one that was answered;
+                // only take ours down when the id matches (or was never told).
+                val mine = gatewayGate.requestId
+                if (event.requestId == null || mine == null || event.requestId == mine) {
+                    gatewayGate.cancel()
+                    gatewayGate.clear()
+                    _state.update { it.copy(pendingApproval = null) }
+                }
+            }
+
+            else -> Unit
+        }
+    }
+
+    /**
+     * Sends an answer to the desktop.
+     *
+     * A 409 (`approval_not_pending`) is a soft outcome: the prompt was already
+     * answered or expired, which needs no error banner — just a note.
+     */
+    private suspend fun postDecision(runId: String, requestId: String?, choice: String) {
+        val settings = _state.value.settings
+        // The run lives on the gateway; if the user switched back to DeepSeek
+        // while the dialog was open, there is no endpoint left to answer — and
+        // posting the chat key at api.deepseek.com would be nonsense.
+        if (!settings.usingDesktopBridge) {
+            _state.update {
+                it.copy(
+                    statusMessage = "Modo alterado: a resposta não foi enviada ao PC.",
+                    statusIsError = true,
+                )
+            }
+            return
+        }
+        gatewayClient
+            .respond(
+                baseUrl = settings.baseUrl,
+                apiKey = settings.effectiveApiKey,
+                runId = runId,
+                choice = choice,
+                requestId = requestId,
+            )
+            .onSuccess {
+                _state.update { it.copy(statusMessage = "Resposta enviada ao PC.", statusIsError = false) }
+            }
+            .onFailure { error ->
+                if (error is GatewayApprovalClient.AlreadyResolved) {
+                    _state.update {
+                        it.copy(
+                            statusMessage = error.message ?: "Este pedido já foi respondido.",
+                            statusIsError = false,
+                        )
+                    }
+                } else {
+                    _state.update {
+                        it.copy(error = error.message ?: "Não consegui enviar a resposta ao PC.")
+                    }
+                }
+            }
     }
 
     fun dismissError() = _state.update { it.copy(error = null) }
@@ -378,7 +537,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val loop = AgentLoop(
                 client = client,
                 registry = registry,
-                approvals = approvalGate,
+                // Against the desktop, prompts come from its policy rather than
+                // from this phone's allowlist, so the gateway gate answers them.
+                approvals = if (settings.usingDesktopBridge) gatewayGate else approvalGate,
                 toolContext = toolContext,
                 resolveImages = resolveImages,
             )

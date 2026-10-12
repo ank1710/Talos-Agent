@@ -89,6 +89,8 @@ class AgentLoop(
                     is StreamEvent.Usage -> emit(AgentEvent.UsageReported(event.usage))
                     is StreamEvent.Finished -> Unit
                     is StreamEvent.Failed -> failure = event.message
+                    is StreamEvent.GatewayApprovalRequested -> Unit
+                    is StreamEvent.GatewayApprovalResolved -> Unit
                 }
             }
 

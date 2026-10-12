@@ -174,4 +174,22 @@ sealed interface StreamEvent {
     data class Finished(val reason: String?) : StreamEvent
     data class Usage(val usage: WireUsage) : StreamEvent
     data class Failed(val message: String, val retryable: Boolean = false) : StreamEvent
+
+    /**
+     * The desktop agent paused to ask permission (`event == "approval.request"`).
+     *
+     * [runId] is the gateway run the prompt belongs to — the `chatcmpl-…` id in
+     * the chat-completions stream — and [requestId] targets this prompt when
+     * several are pending at once. [choices] is exactly what the remote gate
+     * will accept; the UI must not offer more than that.
+     */
+    data class GatewayApprovalRequested(
+        val runId: String,
+        val requestId: String?,
+        val command: String,
+        val choices: List<String>,
+    ) : StreamEvent
+
+    /** The prompt is gone (`event == "approval.responded"`): answered elsewhere or expired. */
+    data class GatewayApprovalResolved(val runId: String, val requestId: String?) : StreamEvent
 }

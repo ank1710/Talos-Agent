@@ -8,7 +8,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
@@ -26,6 +29,18 @@ import java.util.concurrent.TimeUnit
  * cancels the HTTP call, because [ensureActive] runs between frames.
  */
 class DeepSeekClient(private val http: OkHttpClient = defaultHttpClient()) {
+
+    /**
+     * Sink for the gateway's own control frames (see [StreamEvent.GatewayApprovalRequested]).
+     *
+     * They travel on the same stream as every other [StreamEvent], but
+     * [com.hermes.harness.agent.AgentLoop] — frozen for this feature — matches
+     * the stream exhaustively and has no branch for them, so it would drop them
+     * before the view model ever saw one. The owner of this client installs a
+     * listener here instead. Invoked on the IO dispatcher while the stream is
+     * being read, so implementations must not block.
+     */
+    var onGatewayEvent: ((StreamEvent) -> Unit)? = null
 
     fun streamChat(
         apiKey: String,
@@ -52,6 +67,10 @@ class DeepSeekClient(private val http: OkHttpClient = defaultHttpClient()) {
 
                 val source = body.source()
                 var sawTerminal = false
+                // The gateway labels a chat-completions turn with the chatcmpl id
+                // and reuses it as run_id; keep it as a fallback for frames that
+                // omit run_id.
+                var runId: String? = null
                 while (true) {
                     currentCoroutineContext().ensureActive()
                     val line = source.readUtf8Line() ?: break
@@ -64,10 +83,25 @@ class DeepSeekClient(private val http: OkHttpClient = defaultHttpClient()) {
                         break
                     }
 
+                    // Gateway control frames carry a top-level `event` and are NOT
+                    // OpenAI chunks. They must be recognised *before* the chunk
+                    // decode below: `StreamChunk` has an empty `choices` default
+                    // and `ignoreUnknownKeys`, so a bare approval frame decodes
+                    // "successfully" into an empty chunk and silently vanishes.
+                    val frame = runCatching { HermesJson.parseToJsonElement(data).jsonObject }.getOrNull()
+                    if (frame != null && frame.containsKey("event")) {
+                        gatewayEvent(frame, runId)?.let { event ->
+                            emit(event)
+                            onGatewayEvent?.invoke(event)
+                        }
+                        continue
+                    }
+
                     val chunk = runCatching {
                         HermesJson.decodeFromString(StreamChunk.serializer(), data)
                     }.getOrNull() ?: continue
 
+                    chunk.id?.let { runId = it }
                     chunk.usage?.let { emit(StreamEvent.Usage(it)) }
 
                     for (choice in chunk.choices) {
@@ -102,6 +136,38 @@ class DeepSeekClient(private val http: OkHttpClient = defaultHttpClient()) {
             emit(StreamEvent.Failed(e.message ?: "falha de rede", retryable = true))
         }
     }.flowOn(Dispatchers.IO)
+
+    /**
+     * Decodes one gateway control frame, or null for the ~18 event names this
+     * app does not act on (token deltas, tool starts, run lifecycle, …).
+     *
+     * Wire shapes live in `docs/remote-approvals.md`; only the two approval
+     * events are surfaced. Ignoring the rest silently is intentional — they are
+     * progress noise, and the frames they arrive in never carry a chat chunk.
+     */
+    private fun gatewayEvent(frame: JsonObject, runId: String?): StreamEvent? {
+        fun text(key: String): String? = (frame[key] as? JsonPrimitive)?.contentOrNull
+
+        // Prefer the frame's own run_id; fall back to the chatcmpl id of the turn.
+        val resolvedRunId = text("run_id") ?: runId.orEmpty()
+        return when (text("event")) {
+            "approval.request" -> StreamEvent.GatewayApprovalRequested(
+                runId = resolvedRunId,
+                requestId = text("request_id"),
+                command = text("command").orEmpty(),
+                choices = (frame["choices"] as? JsonArray)
+                    ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+                    .orEmpty(),
+            )
+
+            "approval.responded" -> StreamEvent.GatewayApprovalResolved(
+                runId = resolvedRunId,
+                requestId = text("request_id"),
+            )
+
+            else -> null
+        }
+    }
 
     /** Best-effort model discovery so the settings screen can offer real choices. */
     suspend fun listModels(apiKey: String, baseUrl: String): List<String> = withContext(Dispatchers.IO) {

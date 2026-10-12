@@ -8,6 +8,15 @@ data class ApprovalRequest(
     /** Human-readable sentence describing the concrete action. */
     val preview: String,
     val risk: Risk,
+    /**
+     * Decisions the requester will accept, when it restricts them.
+     *
+     * Null means "no restriction" — the local tool path — and the dialog offers
+     * its full set. The desktop gateway, by contrast, advertises exactly what a
+     * given gate allows: some prompts offer only `once` and `deny`, and offering
+     * "Sempre" there would send a choice the server rejects.
+     */
+    val choices: List<ApprovalDecision>? = null,
 )
 
 enum class ApprovalDecision {
