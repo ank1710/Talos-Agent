@@ -1,0 +1,25 @@
+# Build outputs
+build/
+app/build/
+.gradle/
+*.apk
+*.aab
+*.ap_
+release/
+
+# Machine-specific
+local.properties
+.logs/
+.captures/
+.staging/
+.toolchains/
+
+# The debug keystore is disposable; never ship a real one.
+keystore/
+*.jks
+*.keystore
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store

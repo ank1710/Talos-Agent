@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Hermes build launcher.
+#
+# Keeps every toolchain side effect inside this workspace: the Gradle home, the
+# Android user home and the Gradle distribution all live under Code/, so builds
+# never touch ~/.gradle or ~/.android.
+set -euo pipefail
+
+export JAVA_HOME=/opt/homebrew/opt/openjdk@21
+export PATH="$JAVA_HOME/bin:$PATH"
+
+export GRADLE_USER_HOME=/Users/leonardozanattaribeiro/Desktop/Code/.gradle-home
+export ANDROID_HOME=/Users/leonardozanattaribeiro/Library/Android/sdk
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_USER_HOME=/Users/leonardozanattaribeiro/Desktop/Code/.android-home
+
+GRADLE_BIN=/Users/leonardozanattaribeiro/Desktop/Code/.toolchains/gradle-9.8.1/bin/gradle
+
+exec "$GRADLE_BIN" --console=plain "$@"

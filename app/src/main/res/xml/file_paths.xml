@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!--
+      Only the camera capture directory is exposed. Keeping the provider this
+      narrow means a leaked URI cannot be walked into app-private storage.
+    -->
+    <cache-path
+        name="captures"
+        path="captures/" />
+</paths>
