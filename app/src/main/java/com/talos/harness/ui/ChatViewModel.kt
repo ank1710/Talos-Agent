@@ -21,6 +21,7 @@ import com.talos.harness.gateway.GatewayApprovalClient
 import com.talos.harness.gateway.GatewayApprovalGate
 import com.talos.harness.gateway.decisionForGatewayChoice
 import com.talos.harness.gateway.gatewayChoiceFor
+import com.talos.harness.llm.ChatBackend
 import com.talos.harness.llm.DeepSeekClient
 import com.talos.harness.llm.StreamEvent
 import com.talos.harness.llm.WireUsage
@@ -54,6 +55,8 @@ import com.talos.harness.tools.NotifyTool
 import com.talos.harness.tools.OpenUrlTool
 import com.talos.harness.tools.ReadFileTool
 import com.talos.harness.tools.ShellTool
+import com.talos.harness.tools.SpawnSubagentTool
+import com.talos.harness.tools.Tool
 import com.talos.harness.tools.ToolContext
 import com.talos.harness.tools.ToolRegistry
 import com.talos.harness.tools.WriteFileTool
@@ -170,8 +173,45 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val workspace = File(app.filesDir, "workspace").apply { mkdirs() }
     private val toolContext = ToolContext(app, workspace)
-    private val registry = ToolRegistry(
-        listOf(
+
+    /**
+     * The registry for the agent the user talks to (depth 0).
+     *
+     * It is built through [buildTools] rather than listed here, and a fresh one is
+     * built per turn inside [startRun], because the spawner has to capture the
+     * model, the credential and the backend of *that* turn: caching a registry
+     * built while a different provider was selected would send a subagent to the
+     * wrong endpoint with the wrong key.
+     */
+    private fun registryFor(backend: ChatBackend, settings: TalosSettings): ToolRegistry =
+        buildTools(
+            depth = 0,
+            backend = backend,
+            settings = settings,
+            approvals = if (settings.usingDesktopBridge) gatewayGate else approvalGate,
+        )
+
+    /**
+     * Builds the toolset for one nesting depth, recursively.
+     *
+     * A depth that may still delegate gets a [SpawnSubagentTool] whose
+     * [RegistryFactory] is this same builder at `depth + 1`, so a child is never
+     * handed a tool that would let it delegate past [SpawnSubagentTool.MAX_DEPTH].
+     * Termination is structural, not runtime: at the maximum depth no spawner is
+     * added at all, so the recursion bottoms out without ever calling itself —
+     * and the spawner's own guard is a second refusal for a model that tries
+     * anyway.
+     *
+     * Everything the root agent can do is available to every subagent, because a
+     * subagent that cannot run `shell` or read a file is just a second opinion.
+     */
+    private fun buildTools(
+        depth: Int,
+        backend: ChatBackend,
+        settings: TalosSettings,
+        approvals: ApprovalGate,
+    ): ToolRegistry {
+        val tools = mutableListOf<Tool>(
             // Filesystem and shell.
             ShellTool(),
             ReadFileTool(),
@@ -189,8 +229,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // Network. CAUTION: an unattended run must not be able to POST your
             // data anywhere without you opting that task in.
             FetchUrlTool(),
-        ),
-    )
+        )
+
+        if (depth < SpawnSubagentTool.MAX_DEPTH) {
+            tools += SpawnSubagentTool(
+                depth = depth,
+                backend = backend,
+                // The parent's gate, deliberately: nested work must not be able
+                // to skip a confirmation the user would have been asked for.
+                approvals = approvals,
+                toolContext = toolContext,
+                registryFactory = { next -> buildTools(next, backend, settings, approvals) },
+                apiKey = settings.effectiveApiKey,
+                baseUrl = settings.baseUrl,
+                model = settings.effectiveModel,
+                temperature = settings.temperature,
+            )
+        }
+
+        return ToolRegistry(tools)
+    }
 
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
@@ -605,11 +663,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(isRunning = true) }
 
         runJob = viewModelScope.launch {
+            // CLOUD and DESKTOP bind the selected provider's auth to this turn;
+            // only ON_DEVICE swaps out the remote client entirely.
+            val turnBackend = if (local) onDeviceEngine else client.forProvider(settings.provider)
             val loop = AgentLoop(
-                // CLOUD and DESKTOP bind the selected provider's auth to this turn;
-                // only ON_DEVICE swaps out the remote client entirely.
-                client = if (local) onDeviceEngine else client.forProvider(settings.provider),
-                registry = registry,
+                client = turnBackend,
+                // Rebuilt per turn, so the subagent spawner in it captures the
+                // backend, model and credential that this turn is actually using.
+                registry = registryFor(turnBackend, settings),
                 // Against the desktop, prompts come from its policy rather than
                 // from this phone's allowlist, so the gateway gate answers them.
                 // [TalosSettings.usingDesktopBridge] is false on-device, so a local
