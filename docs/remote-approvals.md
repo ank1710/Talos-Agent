@@ -74,34 +74,44 @@ The work is therefore: a gateway approval transport (parse the event, POST the
 decision), a second `ApprovalGate`, and surfacing it in the UI as a notification
 with actions so it can be answered from the shade.
 
-## Live verification attempt — did NOT reach the approval path
+## Live verification — PASSED
 
-The feature is implemented and compiles (`dcc3af8`), but the first live attempt to
-verify it end to end **failed to trigger a gate**, so it remains runtime-unverified.
+Verified end to end from the phone, after one earlier attempt that did not reach
+the gate (kept below, because the reason it failed is the reason this test works).
 
-What was tried: PC mode on, gateway key present, `adb reverse tcp:8642` up, and the
-prompt *"Escreva um arquivo AGENTS.md com o texto teste na pasta de trabalho"*.
+The prompt must **force the path**: *"Escreva o /tmp/hermes-approval-test/AGENTS.md
+com o texto teste"*. Letting the agent choose the location is not a test — it wrote
+to its own scratch directory and no gate fired.
 
-What happened: the desktop agent wrote
-`/Users/leonardozanattaribeiro/Desktop/Code/hermes-bridge/cache/scratch/AGENTS.md`
-and reported success. **No `approval.request` was emitted**, so no prompt reached
-the phone.
+What was observed:
 
-Two facts worth carrying forward:
+1. The desktop agent paused; the phone showed **"Permitir ação no computador?"**
+   with the preview `<write to AGENTS.md>` — the gateway's `command` field, arriving
+   on the `approval.request` SSE frame. The title differs from the local gate's
+   ("Permitir fetch_url?"), which is how the UI distinguishes the source.
+2. The dialog offered **only Permitir and Recusar, no "Sempre"** — correct, because
+   the event advertised `["once","deny"]`. The advertised-choices rule holds in
+   practice, not just in the mapping table.
+3. Tapping Permitir POSTed the decision, the desktop resumed, and
+   `/tmp/hermes-approval-test/AGENTS.md` appeared on the Mac containing `teste`.
 
-1. **The gate is location- or context-sensitive in a way not yet characterised.**
-   The research probe *did* trip it with an `AGENTS.md` under `/tmp`, reporting
-   `pattern_key: protected_instruction_file`. The same filename under the gateway's
-   own scratch directory did not. Until that difference is understood, a test that
-   lets the agent choose the location is not a test of the approval path.
-2. **The desktop agent cannot write to its own working directory here** — it
-   reported `Operation not permitted` for `/Users/leonardozanattaribeiro` and fell
-   back to its scratch dir. That constrains which paths a phone-driven request can
-   even reach.
+That exercises the whole path: the parser trap avoided, the run-id threading, the
+choice mapping, the POST, and the desktop's fail-closed wait.
 
-To verify properly, the prompt must force a path that matches the protected
-pattern (the probe's approach: a throwaway `AGENTS.md` in a fresh temp directory),
-rather than describing the file and letting the agent pick.
+### The earlier attempt that did NOT reach the gate
+
+Kept because the failure mode is easy to repeat. The prompt was *"Escreva um
+arquivo AGENTS.md com o texto teste na pasta de trabalho"* — it let the agent pick
+the location, and it wrote `cache/scratch/AGENTS.md` with **no `approval.request`
+emitted at all**. Seeing "Pronto" on screen would have looked like success while
+testing nothing. Two facts worth carrying forward:
+
+1. **The gate is location-sensitive.** The same filename under `/tmp` trips
+   `pattern_key: protected_instruction_file`; under the gateway's own scratch
+   directory it does not. A test must pin the path.
+2. **The desktop agent cannot write to its own cwd here** — it reported
+   `Operation not permitted` for `/Users/leonardozanattaribeiro` and fell back to
+   scratch, which constrains what a phone-driven request can reach.
 
 ## Gateway-side policy worth knowing
 
