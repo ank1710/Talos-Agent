@@ -22,6 +22,7 @@ import com.talos.harness.agent.Role
 import com.talos.harness.agent.SystemPrompt
 import com.talos.harness.llm.DeepSeekClient
 import com.talos.harness.notifications.TalosNotifications
+import com.talos.harness.store.ModelMode
 import com.talos.harness.store.TalosSettings
 import com.talos.harness.store.SettingsRepository
 import com.talos.harness.tools.ClipboardReadTool
@@ -74,6 +75,20 @@ class ScheduledAgentWorker(
                 // the run — it is an unconfigured app. Retrying would burn the
                 // backoff budget forever on a condition only the user can fix.
                 recordWithoutRunning(store, oneShotId, "erro: chave da API não configurada")
+                return@withContext Result.success()
+            }
+
+            // On-device mode reports as configured because it needs no key, but
+            // this worker speaks HTTP through [DeepSeekClient] only: a due task
+            // would post an empty key at the cloud endpoint on every pass and fill
+            // the notification shade with network errors. Record the reason once
+            // and let the user run the task by hand from the chat screen.
+            if (settings.mode == ModelMode.ON_DEVICE) {
+                recordWithoutRunning(
+                    store,
+                    oneShotId,
+                    "erro: tarefa agendada precisa da nuvem ou do PC",
+                )
                 return@withContext Result.success()
             }
 

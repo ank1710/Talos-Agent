@@ -98,6 +98,8 @@ import com.talos.harness.agent.MessageStatus
 import com.talos.harness.agent.Risk
 import com.talos.harness.agent.Role
 import com.talos.harness.llm.WireUsage
+import com.talos.harness.local.ModelFile
+import com.talos.harness.local.ModelRecommendation
 import com.talos.harness.store.ConversationSummary
 import com.talos.harness.ui.markdown.MarkdownText
 import com.talos.harness.ui.theme.TalosColors
@@ -130,8 +132,10 @@ fun ChatScreen(
     onToggleSpeak: () -> Unit,
     onStopSpeaking: () -> Unit,
     onOpenSchedule: () -> Unit,
-    onUseLocal: () -> Unit,
+    onUseCloud: () -> Unit,
     onUsePc: () -> Unit,
+    onUseOnDevice: () -> Unit,
+    onRefreshModels: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val palette = TalosColors.current
@@ -232,8 +236,12 @@ fun ChatScreen(
                     scope.launch { drawerState.close() }
                 },
                 delegatingToPc = state.delegatingToPc,
-                onUseLocal = onUseLocal,
+                onDeviceMode = state.onDevice,
+                onDeviceRunnable = state.deviceRecommendation?.runnable,
+                onDeviceReason = state.deviceRecommendation?.explanation,
+                onUseCloud = onUseCloud,
                 onUsePc = onUsePc,
+                onUseOnDevice = onUseOnDevice,
                 onClose = { scope.launch { drawerState.close() } },
             )
         },
@@ -260,9 +268,14 @@ fun ChatScreen(
                                 text = buildString {
                                     append(state.settings.model.ifBlank { "—" })
                                     if (state.delegatingToPc) append("  ·  no PC")
+                                    if (state.onDevice) append("  ·  no celular")
                                 },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (state.delegatingToPc) palette.brand else palette.textFaint,
+                                color = if (state.delegatingToPc || state.onDevice) {
+                                    palette.brand
+                                } else {
+                                    palette.textFaint
+                                },
                             )
                         }
                     },
@@ -324,6 +337,15 @@ fun ChatScreen(
                             }
                         }
                     }
+                }
+
+                if (state.onDevice) {
+                    OnDeviceStrip(
+                        recommendation = state.deviceRecommendation,
+                        models = state.installedModels,
+                        directory = state.modelsDirectory,
+                        onRefresh = onRefreshModels,
+                    )
                 }
 
                 state.usage?.let { UsageStrip(it) }
@@ -661,6 +683,92 @@ private fun UsageStrip(usage: WireUsage) {
     }
 }
 
+// ------------------------------------------------------------------- local mode
+
+/**
+ * What "on this phone" means right now.
+ *
+ * In ON_DEVICE mode the two facts that decide whether a turn can work at all —
+ * what the probe measured and which bundles are on disk — are otherwise invisible
+ * until something fails, so both are always on screen: the recommendation's own
+ * Portuguese sentence (capped and scrollable, never truncated into a lie) and the
+ * actual file list. An empty list states where a bundle has to go instead of
+ * offering a mode that cannot answer.
+ */
+@Composable
+private fun OnDeviceStrip(
+    recommendation: ModelRecommendation?,
+    models: List<ModelFile>,
+    directory: String,
+    onRefresh: () -> Unit,
+) {
+    val palette = TalosColors.current
+    val usable = recommendation?.runnable != false
+
+    Surface(color = palette.surfaceVariant) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Modelo no celular",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (usable) palette.brand else palette.danger,
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    text = "Atualizar lista",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.brand,
+                    modifier = Modifier.clickable { onRefresh() },
+                )
+            }
+
+            Text(
+                text = recommendation?.explanation
+                    ?: "Este aparelho não pôde ser medido; o modelo local ainda pode funcionar.",
+                style = MaterialTheme.typography.labelSmall,
+                color = palette.textFaint,
+                modifier = Modifier
+                    .padding(top = 4.dp)
+                    .heightIn(max = 72.dp)
+                    .verticalScroll(rememberScrollState()),
+            )
+
+            if (models.isEmpty()) {
+                Text(
+                    text = "Nenhum modelo instalado. Copie um arquivo .litertlm para " +
+                        "${directory.ifBlank { "a pasta de modelos do app" }} e toque em " +
+                        "\"Atualizar lista\".",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.caution,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            } else {
+                Column(
+                    modifier = Modifier
+                        .padding(top = 6.dp)
+                        .heightIn(max = 60.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    models.forEach { model ->
+                        Text(
+                            text = "${model.name}  ·  ${model.sizeLabel}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = FontFamily.Monospace,
+                            color = palette.textSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------- input
 
 @Composable
@@ -954,8 +1062,17 @@ private fun ConversationsDrawer(
     onNew: () -> Unit,
     onOpenSchedule: () -> Unit,
     delegatingToPc: Boolean,
-    onUseLocal: () -> Unit,
+    onDeviceMode: Boolean,
+    /**
+     * `DeviceCapability`'s verdict. `null` means the probe did not produce one;
+     * only an explicit `false` disables the chip, so an unmeasured phone is not
+     * locked out of a mode that might work.
+     */
+    onDeviceRunnable: Boolean?,
+    onDeviceReason: String?,
+    onUseCloud: () -> Unit,
     onUsePc: () -> Unit,
+    onUseOnDevice: () -> Unit,
     onClose: () -> Unit,
 ) {
     val palette = TalosColors.current
@@ -996,21 +1113,45 @@ private fun ConversationsDrawer(
         }
 
         // Where the agent runs. Switching also swaps the model id, because the
-        // desktop gateway answers to a different one than DeepSeek does.
+        // desktop gateway answers to a different one than DeepSeek does, and the
+        // on-device mode needs a `.litertlm` file name rather than either id.
         Row(
-            modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+            modifier = Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 6.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             FilterChip(
-                selected = !delegatingToPc,
-                onClick = onUseLocal,
+                selected = !delegatingToPc && !onDeviceMode,
+                onClick = onUseCloud,
                 label = { Text("Neste celular") },
             )
             FilterChip(
                 selected = delegatingToPc,
                 onClick = onUsePc,
                 label = { Text("No PC") },
+            )
+            FilterChip(
+                selected = onDeviceMode,
+                onClick = onUseOnDevice,
+                // A chip that silently does nothing is worse than no chip at all;
+                // when the phone measured as unable to run a local model it stays
+                // visible, disabled, with the probe's own reason right below.
+                enabled = onDeviceRunnable != false,
+                label = { Text("No celular") },
+            )
+        }
+
+        if (onDeviceRunnable == false) {
+            Text(
+                text = onDeviceReason ?: "Este aparelho não comporta um modelo local.",
+                style = MaterialTheme.typography.labelSmall,
+                color = palette.caution,
+                modifier = Modifier
+                    .padding(horizontal = 20.dp, vertical = 2.dp)
+                    .heightIn(max = 120.dp)
+                    .verticalScroll(rememberScrollState()),
             )
         }
 

@@ -24,12 +24,20 @@ import com.talos.harness.gateway.gatewayChoiceFor
 import com.talos.harness.llm.DeepSeekClient
 import com.talos.harness.llm.StreamEvent
 import com.talos.harness.llm.WireUsage
+import com.talos.harness.local.DeviceCapability
+import com.talos.harness.local.DeviceProfile
+import com.talos.harness.local.LocalBackend
+import com.talos.harness.local.ModelFile
+import com.talos.harness.local.ModelRecommendation
+import com.talos.harness.local.ModelStore
+import com.talos.harness.local.OnDeviceBackend
 import com.talos.harness.media.MediaResolver
 import com.talos.harness.schedule.ScheduleScheduler
 import com.talos.harness.schedule.ScheduledTask
 import com.talos.harness.schedule.ScheduledTaskStore
 import com.talos.harness.store.ConversationStore
 import com.talos.harness.store.ConversationSummary
+import com.talos.harness.store.ModelMode
 import com.talos.harness.store.TalosSettings
 import com.talos.harness.store.SettingsRepository
 import com.talos.harness.tools.CalendarReadTool
@@ -49,6 +57,7 @@ import com.talos.harness.tools.ToolRegistry
 import com.talos.harness.tools.WriteFileTool
 import com.talos.harness.voice.VoiceController
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -56,6 +65,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -90,8 +100,21 @@ data class ChatUiState(
     val voiceAvailable: Boolean = true,
     /** Unattended tasks, mirrored from disk so the UI never reads files itself. */
     val scheduledTasks: List<ScheduledTask> = emptyList(),
+    /** `.litertlm` bundles on disk, mirrored so the UI never touches storage. */
+    val installedModels: List<ModelFile> = emptyList(),
+    /** Where a bundle has to be copied; shown when nothing is installed. */
+    val modelsDirectory: String = "",
+    /**
+     * What the device probe measured, or null when the probe itself failed.
+     * The UI shows [ModelRecommendation.explanation] verbatim: it is the honest
+     * reason for the backend and size class the phone was given.
+     */
+    val deviceRecommendation: ModelRecommendation? = null,
 ) {
     val needsSetup: Boolean get() = !settings.isConfigured
+
+    /** True when the weights run on this phone. */
+    val onDevice: Boolean get() = settings.mode == ModelMode.ON_DEVICE
 
     /** Vision needs a multimodal model; a text-only model would silently ignore the pixels. */
     val supportsVision: Boolean
@@ -116,6 +139,32 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val conversationStore = ConversationStore(app.filesDir)
     private val client = DeepSeekClient()
     private val gatewayClient = GatewayApprovalClient()
+
+    /** Shared: the view model resolves names for the preload, the engine for the request. */
+    private val modelStore = ModelStore(appContext)
+
+    /**
+     * Measured once per process. The probe reads free RAM, the ABI list and the
+     * OpenCL driver, so the answer is stable for this view model's lifetime and
+     * the UI, the backend preference and the model choice all read one measurement
+     * instead of three that could disagree.
+     */
+    private val deviceProfile: DeviceProfile? =
+        runCatching { DeviceCapability.probe(appContext) }.getOrNull()
+
+    /**
+     * Built once and kept.
+     *
+     * `Engine.initialize()` costs seconds and the engine then owns native memory,
+     * so constructing it per turn would make every turn slow and every turn leak.
+     * The preferred backend is whatever [DeviceCapability] measured; the load path
+     * degrades to the CPU on its own if the driver refuses.
+     */
+    private val onDeviceEngine = OnDeviceBackend(
+        context = appContext,
+        models = modelStore,
+        preferredBackend = deviceProfile?.recommendation?.backend ?: LocalBackend.GPU,
+    )
 
     private val workspace = File(app.filesDir, "workspace").apply { mkdirs() }
     private val toolContext = ToolContext(app, workspace)
@@ -210,6 +259,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         refreshConversations()
         refreshTasks()
+        // Read the models directory up front: the drawer needs to know whether a
+        // local run is even possible before the user picks that mode.
+        refreshInstalledModels()
 
         _state.update { it.copy(voiceAvailable = voice.isRecognitionAvailable()) }
 
@@ -231,6 +283,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         voice.shutdown()
+        // The engine holds native memory; a view model teardown that dropped the
+        // reference without closing would keep the model's mapping alive in a
+        // process Android already treats as tight.
+        onDeviceEngine.release()
         super.onCleared()
     }
 
@@ -540,21 +596,38 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun startRun() {
         val settings = _state.value.settings
         val history = _state.value.conversation.messages
+        val local = settings.mode == ModelMode.ON_DEVICE
 
         runJob?.cancel()
         _state.update { it.copy(isRunning = true) }
 
         runJob = viewModelScope.launch {
             val loop = AgentLoop(
-                client = client,
+                // The cloud client stays the default: CLOUD and DESKTOP keep the
+                // exact backend they had, and only ON_DEVICE swaps it.
+                client = if (local) onDeviceEngine else client,
                 registry = registry,
                 // Against the desktop, prompts come from its policy rather than
                 // from this phone's allowlist, so the gateway gate answers them.
+                // [TalosSettings.usingDesktopBridge] is false on-device, so a local
+                // turn keeps the phone's own approval gate.
                 approvals = if (settings.usingDesktopBridge) gatewayGate else approvalGate,
                 toolContext = toolContext,
                 resolveImages = resolveImages,
             )
             try {
+                // The weights are loaded before the loop asks for a token;
+                // `initialize()` takes seconds, and discovering that on the first
+                // streamed turn looks like a freeze. Nothing installed or a failed
+                // load is reported here, in Portuguese, instead of as a silent stall.
+                if (local) {
+                    val problem = preloadOnDevice(settings)
+                    if (problem != null) {
+                        _state.update { it.copy(error = problem) }
+                        return@launch
+                    }
+                }
+
                 loop.run(
                     apiKey = settings.effectiveApiKey,
                     baseUrl = settings.baseUrl,
@@ -572,6 +645,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 persist(_state.value.conversation)
             }
         }
+    }
+
+    /**
+     * Loads the on-device engine ahead of the loop, or returns why it could not.
+     *
+     * The configured name wins when it resolves to a file on disk, because that is
+     * also how [OnDeviceBackend.streamChat] resolves `ChatRequest.model`. A null
+     * from [OnDeviceBackend.ensureDefaultLoaded] means *nothing* is installed —
+     * the one case the backend would otherwise report only after the first token
+     * was requested — and a thrown [com.talos.harness.local.LocalModelException]
+     * carries the loader's own Portuguese reason.
+     */
+    private suspend fun preloadOnDevice(settings: TalosSettings): String? = try {
+        val recommendation = _state.value.deviceRecommendation ?: deviceProfile?.recommendation
+        val configured = modelStore.pathFor(settings.effectiveModel)
+        if (configured != null) {
+            onDeviceEngine.ensureLoaded(configured)
+            null
+        } else if (onDeviceEngine.ensureDefaultLoaded(recommendation) == null) {
+            "Nenhum modelo instalado no celular. Copie um arquivo .litertlm para " +
+                "${modelStore.directory().absolutePath} e tente de novo."
+        } else {
+            null
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Throwable) {
+        e.message ?: "Não foi possível carregar o modelo no celular."
     }
 
     private fun handle(event: AgentEvent) {
@@ -715,6 +816,29 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun updateTemperature(value: Double) = viewModelScope.launch { settingsRepo.setTemperature(value) }
 
     /**
+     * Re-reads what is on disk.
+     *
+     * Called from `init`, when the user switches the mode, and from the strip's
+     * refresh action: the list the user reads and the list the loader resolves
+     * against must be the same one, and a bundle can be pushed while the app is
+     * already open.
+     */
+    fun refreshInstalledModels() {
+        viewModelScope.launch {
+            val (directory, installed) = withContext(Dispatchers.IO) {
+                modelStore.directory().absolutePath to modelStore.installed()
+            }
+            _state.update {
+                it.copy(
+                    installedModels = installed,
+                    modelsDirectory = directory,
+                    deviceRecommendation = deviceProfile?.recommendation,
+                )
+            }
+        }
+    }
+
+    /**
      * Routes requests through the Talos gateway on the desktop.
      *
      * Base URL, model **and credential** all resolve from the mode: the gateway
@@ -725,6 +849,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun useDesktopBridge() {
         viewModelScope.launch {
+            settingsRepo.setMode(ModelMode.DESKTOP)
             settingsRepo.setBaseUrl(TalosSettings.LOCAL_GATEWAY_BASE_URL)
             settingsRepo.setModel(TalosSettings.GATEWAY_MODEL)
             _state.update { it.copy(statusMessage = "Rodando no PC.", statusIsError = false) }
@@ -732,11 +857,47 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Goes back to calling DeepSeek directly from the phone. */
-    fun useOnDeviceModel() {
+    fun useCloud() {
         viewModelScope.launch {
+            settingsRepo.setMode(ModelMode.CLOUD)
             settingsRepo.setBaseUrl(TalosSettings.DEFAULT_BASE_URL)
             settingsRepo.setModel(TalosSettings.DEFAULT_MODEL)
-            _state.update { it.copy(statusMessage = "Rodando neste celular.", statusIsError = false) }
+            _state.update { it.copy(statusMessage = "Rodando na nuvem.", statusIsError = false) }
+        }
+    }
+
+    /**
+     * Switches to the model running on this phone.
+     *
+     * The model field is repointed at a bundle that is actually on disk, because
+     * [OnDeviceBackend.streamChat] resolves `ChatRequest.model` through
+     * [ModelStore] — leaving a cloud id there ("deepseek-flash") would make the
+     * first turn fail with two models installed. With nothing installed the field
+     * is left alone and the chat strip says where to copy a bundle instead of
+     * clobbering a name the user may still want.
+     */
+    fun useOnDeviceModel() {
+        viewModelScope.launch {
+            val recommendation = deviceProfile?.recommendation
+            val (directory, installed) = withContext(Dispatchers.IO) {
+                modelStore.directory().absolutePath to modelStore.installed()
+            }
+            val chosen = modelStore.default(recommendation)
+            settingsRepo.setMode(ModelMode.ON_DEVICE)
+            chosen?.let { settingsRepo.setModel(it.name) }
+            _state.update {
+                it.copy(
+                    installedModels = installed,
+                    modelsDirectory = directory,
+                    deviceRecommendation = recommendation,
+                    statusMessage = if (chosen == null) {
+                        "Modo no celular ativado, mas nenhum modelo está instalado."
+                    } else {
+                        "Rodando no celular: ${chosen.name}."
+                    },
+                    statusIsError = chosen == null,
+                )
+            }
         }
     }
 

@@ -205,8 +205,10 @@ private fun TalosRoot(
             onToggleSpeak = viewModel::toggleSpeakReplies,
             onStopSpeaking = viewModel::stopSpeaking,
             onOpenSchedule = { showSchedule = true },
-            onUseLocal = viewModel::useOnDeviceModel,
+            onUseCloud = viewModel::useCloud,
             onUsePc = viewModel::useDesktopBridge,
+            onUseOnDevice = viewModel::useOnDeviceModel,
+            onRefreshModels = viewModel::refreshInstalledModels,
         )
     }
 }
