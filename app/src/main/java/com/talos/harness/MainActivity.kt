@@ -166,6 +166,11 @@ private fun TalosRoot(
             isBusy = state.isBusy,
             statusMessage = state.statusMessage,
             statusIsError = state.statusIsError,
+            // The mode choice and its on-device evidence moved here from the chat
+            // drawer, so Settings now owns these two.
+            deviceRecommendation = state.deviceRecommendation,
+            installedModels = state.installedModels,
+            modelsDirectory = state.modelsDirectory,
             onApiKeyChange = viewModel::updateApiKey,
             onProviderChange = viewModel::selectProvider,
             onBaseUrlChange = viewModel::updateBaseUrl,
@@ -173,6 +178,10 @@ private fun TalosRoot(
             onGatewayApiKeyChange = viewModel::updateGatewayApiKey,
             onModelChange = viewModel::updateModel,
             onTemperatureChange = viewModel::updateTemperature,
+            onUseCloud = viewModel::useCloud,
+            onUsePc = viewModel::useDesktopBridge,
+            onUseOnDevice = viewModel::useOnDeviceModel,
+            onRefreshModels = viewModel::refreshInstalledModels,
             onFetchModels = viewModel::fetchModels,
             onTestConnection = viewModel::testConnection,
             onRevokeApproval = viewModel::revokeApproval,
@@ -207,10 +216,6 @@ private fun TalosRoot(
             onToggleSpeak = viewModel::toggleSpeakReplies,
             onStopSpeaking = viewModel::stopSpeaking,
             onOpenSchedule = { showSchedule = true },
-            onUseCloud = viewModel::useCloud,
-            onUsePc = viewModel::useDesktopBridge,
-            onUseOnDevice = viewModel::useOnDeviceModel,
-            onRefreshModels = viewModel::refreshInstalledModels,
         )
     }
 }
