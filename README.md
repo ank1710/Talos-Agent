@@ -1,10 +1,10 @@
-# Hermes
+# Talos
 
 A DeepSeek-powered agent harness that runs **on the phone**, not in a browser tab.
 Native Android (Kotlin + Jetpack Compose), built and installed over `adb`.
 
 The agent loop, the tool executor and the model client all live in the app. When
-the phone is next to the computer, the same client can instead point at a Hermes
+the phone is next to the computer, the same client can instead point at a Talos
 Agent gateway on the desktop — the protocol is identical, only the base URL and
 key change.
 
@@ -35,16 +35,16 @@ key change.
   model described the picture accurately.
 - Voice input transcribed ambient speech into the composer with locale `pt-BR`; TTS loaded the
   `pt_BR` language pack and played.
-- `notify` produced a real `NotificationRecord` on the `hermes_agent` channel.
+- `notify` produced a real `NotificationRecord` on the `talos_agent` channel.
 
 
 ## Build and install
 
 ```bash
-cd hermes-android
+cd talos-android
 ./gw :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n com.hermes.harness.debug/com.hermes.harness.MainActivity
+adb shell am start -n com.talos.harness.debug/com.talos.harness.MainActivity
 ```
 
 `./gw` pins `JAVA_HOME`, `GRADLE_USER_HOME`, `ANDROID_HOME` and `ANDROID_USER_HOME`
@@ -123,8 +123,8 @@ media/         MediaResolver — content URI to downscaled base64 data URL, with
 voice/         VoiceController — SpeechRecognizer + TextToSpeech, main-thread marshalled
 schedule/      ScheduledTask, ScheduledTaskStore, ScheduledAgentWorker, ScheduleScheduler
 store/         SettingsRepository (DataStore), ConversationStore (JSON files)
-notifications/ HermesNotifications — the single channel everything posts to
-ui/theme/      HermesPalette + HermesTheme
+notifications/ TalosNotifications — the single channel everything posts to
+ui/theme/      TalosPalette + TalosTheme
 ui/markdown/   pure, total markdown parser + Compose renderer
 ```
 
@@ -187,8 +187,8 @@ Ordered by how much they matter.
   non-existent name so that no real contact data had to leave the device.
 - **The completion notification for a scheduled run is confirmed.** A forced
   unattended run persisted `lastStatus: "ok"` and left a real
-  `NotificationRecord` on the `hermes_agent` channel, so the worker's
-  `HermesNotifications.post` call is exercised, not just written.
+  `NotificationRecord` on the `talos_agent` channel, so the worker's
+  `TalosNotifications.post` call is exercised, not just written.
 - **The API keys are stored in app-private DataStore, not behind the Keystore.**
   Fine for a private build; harden before distributing.
 - **`release` builds are unsigned and unminified.**
@@ -204,6 +204,6 @@ times while building: taps landing in another app (One UI opens Google search
 from BACK on the home screen), a `dumpsys` grep that matched a different app, and
 `input text` racing the soft keyboard. Confirm each step against `mCurrentFocus`
 before trusting it, and prefer reading state the app wrote to disk
-(`files/schedule/tasks.json`, `files/datastore/hermes_settings.preferences_pb`)
+(`files/schedule/tasks.json`, `files/datastore/talos_settings.preferences_pb`)
 over inferring it from a screenshot.
 

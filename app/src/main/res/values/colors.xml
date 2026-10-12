@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="hermes_ink">#FF0E1116</color>
-    <color name="hermes_brand">#FF4D6BFE</color>
+    <!-- App surface. Near-black with a blue cast: all verified UI work uses it. -->
+    <color name="talos_ink">#FF0E1116</color>
+    <!-- In-app accent. -->
+    <color name="talos_brand">#FF4D6BFE</color>
+    <!--
+      Launcher identity. Talos was the bronze automaton, so the icon is bronze
+      rather than the in-app accent: the mark should say what the app is, not
+      repeat the button colour.
+    -->
+    <color name="talos_bronze">#FFA96B33</color>
 </resources>

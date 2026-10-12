@@ -16,7 +16,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!--
-      No CAMERA permission on purpose. Hermes never touches the camera API: it
+      No CAMERA permission on purpose. Talos never touches the camera API: it
       hands ACTION_IMAGE_CAPTURE to whatever camera app the user has. Declaring
       the permission would make Android *require* it at runtime for that intent
       to work, turning a free delegation into a permission prompt.
@@ -29,13 +29,13 @@
         android:required="false" />
 
     <application
-        android:name=".HermesApp"
+        android:name=".TalosApp"
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Hermes">
+        android:theme="@style/Theme.Talos">
 
         <activity
             android:name=".MainActivity"
@@ -47,7 +47,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Share sheet: any app can hand Hermes text, a link or a picture. -->
+            <!-- Share sheet: any app can hand Talos text, a link or a picture. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -55,7 +55,7 @@
                 <data android:mimeType="image/*" />
             </intent-filter>
 
-            <!-- Text-selection menu: "Hermes" appears next to Copy/Paste. -->
+            <!-- Text-selection menu: "Talos" appears next to Copy/Paste. -->
             <intent-filter>
                 <action android:name="android.intent.action.PROCESS_TEXT" />
                 <category android:name="android.intent.category.DEFAULT" />

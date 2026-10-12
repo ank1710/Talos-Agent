@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.hermes.harness"
+    namespace = "com.talos.harness"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.hermes.harness"
+        applicationId = "com.talos.harness"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

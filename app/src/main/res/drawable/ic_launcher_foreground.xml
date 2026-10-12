@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Hermes mark: an orbital ring with a four-point spark at its core. -->
+<!--
+  Talos mark: the bronze automaton reduced to a ring (its hollow bronze body)
+  around a monogram core. Deliberately simple geometry, because it has to read at
+  48dp on a launcher. The fill is opaque white; tinting is the launcher's job.
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
@@ -8,11 +12,11 @@
 
     <path
         android:fillColor="#00000000"
-        android:pathData="M54,29 A25,25 0 1,1 53.9,29"
+        android:pathData="M54,27 A27,27 0 1,1 53.9,27"
         android:strokeColor="#FFFFFF"
-        android:strokeWidth="4" />
+        android:strokeWidth="4.5" />
 
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M54,40 L59.5,52.5 L72,58 L59.5,63.5 L54,76 L48.5,63.5 L36,58 L48.5,52.5 Z" />
+        android:pathData="M36,41 H72 V49 H58.5 V78 H49.5 V49 H36 Z" />
 </vector>

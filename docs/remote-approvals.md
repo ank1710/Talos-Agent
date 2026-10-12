@@ -116,7 +116,7 @@ testing nothing. Two facts worth carrying forward:
 ## Gateway-side policy worth knowing
 
 - The server-side agent's toolsets come from `platform_toolsets.api_server`
-  (`api_server.py:2374`, `hermes_cli/tools_config.py:573-583`). That key is
+  (`api_server.py:2374`, `talos_cli/tools_config.py:573-583`). That key is
   **absent** in this machine's `config.yaml`, so the platform default applies.
   The global `toolsets: [hermes-cli, web]` key does **not** drive the API-server
   agent — a natural but wrong assumption.
