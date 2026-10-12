@@ -14,9 +14,16 @@ import kotlinx.coroutines.CompletableDeferred
  * `ChatViewModel`, so the approval dialog renders both identically and an
  * answer arriving from any channel is just a [submit].
  *
- * One prompt at a time: the gateway can raise several on one run, but the brief
- * leaves that unverified and this app only ever shows one dialog, so a second
- * [request] supersedes the first rather than queueing.
+ * Several prompts can be in flight at once. The gateway keys every
+ * `approval.request` by its `request_id` and accepts a matching `request_id` on
+ * the decision POST, so this gate keeps *all* parked prompts instead of one
+ * slot. A single slot would strand the earlier caller forever, because a second
+ * [request] would overwrite the deferred that [submit] and [cancel] reach.
+ *
+ * The app still shows one dialog at a time, and prompts are published in the
+ * order they arrived, so [submit] answers the oldest — FIFO is the honest
+ * behaviour for a one-dialog UI. [submitFor] targets one specific
+ * `request_id` for a caller that already knows which prompt it is deciding.
  *
  * Unlike the local gate this is *not* consulted against the on-device
  * allowlist. The allowlist is about tools this phone runs; a prompt from the
@@ -30,10 +37,49 @@ class GatewayApprovalGate(
     private val onSettled: (ApprovalRequest) -> Unit = {},
 ) : ApprovalGate {
 
-    @Volatile
-    private var deferred: CompletableDeferred<ApprovalDecision>? = null
+    /**
+     * One parked prompt together with the ids read off the frame that raised it.
+     *
+     * The ids are kept per entry, not only in the [runId]/[requestId]/[choices]
+     * scalars below: with several prompts in flight those scalars describe the
+     * frame that arrived *last*, while the decision POST must carry the ids of
+     * the prompt the user was actually shown.
+     */
+    data class Parked(
+        val request: ApprovalRequest,
+        val runId: String?,
+        val requestId: String?,
+        val choices: List<String>,
+    )
 
-    /** Run the parked prompt belongs to; null when no desktop prompt is known. */
+    private class Slot(
+        val key: String,
+        val parked: Parked,
+        val deferred: CompletableDeferred<ApprovalDecision> = CompletableDeferred(),
+    )
+
+    /** Guards [parked] and [displayed]; callbacks are always fired outside it. */
+    private val lock = Any()
+
+    /**
+     * Every prompt still waiting, oldest first.
+     *
+     * A [LinkedHashMap] iterates in insertion order, so "oldest" is just the
+     * first live entry — no second queue that could drift out of step.
+     */
+    private val parked = LinkedHashMap<String, Slot>()
+
+    /** Key of the entry currently published through [onPending], if any. */
+    private var displayed: String? = null
+
+    /**
+     * Run id of the most recently [attach]ed frame; null when no desktop prompt
+     * is known.
+     *
+     * Kept for callers that only care about the latest frame. Prefer [oldest]
+     * when answering a prompt, because this scalar is overwritten by every
+     * later frame even while an earlier prompt is still on screen.
+     */
     @Volatile
     var runId: String? = null
         private set
@@ -53,7 +99,8 @@ class GatewayApprovalGate(
      *
      * [request] may be reached before the frame is parsed (the loop can park
      * first), so the association is a separate, repeatable call rather than a
-     * constructor argument.
+     * constructor argument. [request] snapshots these values into its own
+     * entry, so a later frame does not rewrite an already-parked prompt's ids.
      */
     fun attach(runId: String?, requestId: String?, choices: List<String> = emptyList()) {
         this.runId = runId
@@ -68,33 +115,113 @@ class GatewayApprovalGate(
         choices = emptyList()
     }
 
+    /** The oldest prompt still waiting, with the ids needed to answer it. */
+    val oldest: Parked?
+        get() = synchronized(lock) {
+            parked.values.firstOrNull { !it.deferred.isCompleted }?.parked
+        }
+
+    /** How many prompts are still waiting for an answer. */
+    val pendingCount: Int
+        get() = synchronized(lock) { parked.values.count { !it.deferred.isCompleted } }
+
     override suspend fun request(request: ApprovalRequest): ApprovalDecision {
-        val pending = CompletableDeferred<ApprovalDecision>()
-        deferred = pending
-        onPending(request)
+        // Snapshot the ids now: a frame that arrives while this prompt is
+        // parked would otherwise overwrite the scalars and mis-address the
+        // answer for this one.
+        val snapshot = Parked(request, runId, requestId, choices)
+        val slot = synchronized(lock) {
+            // request_id is the gateway's own key. Without one, the run id is
+            // the best grouping; a prompt with neither still gets a unique key
+            // from its own id so two of them cannot clobber each other.
+            val base = snapshot.requestId ?: snapshot.runId ?: request.id
+            var key = base
+            var suffix = 2
+            while (parked.containsKey(key)) key = "$base#${suffix++}"
+            Slot(key, snapshot).also { parked[key] = it }
+        }
+        // Only the head of the queue reaches the dialog; the rest wait their turn.
+        publishHead()
         return try {
-            pending.await()
+            slot.deferred.await()
         } finally {
-            // Only drop our own slot: a prompt that arrived in the meantime must
-            // not be detached by the previous one unwinding.
-            if (deferred === pending) deferred = null
+            synchronized(lock) {
+                parked.remove(slot.key)
+                // Only the entry that was on screen frees the dialog, so a
+                // prompt settled out of order cannot blank someone else's.
+                if (displayed == slot.key) displayed = null
+            }
             onSettled(request)
+            // The dialog is free now: reveal the next prompt, if one is waiting.
+            publishHead()
         }
     }
 
-    /** Answers the parked prompt. A no-op when nothing is waiting. */
+    /**
+     * Answers the oldest parked prompt (FIFO). A no-op when nothing is waiting.
+     *
+     * The gate publishes prompts in arrival order, so the one on screen *is*
+     * the oldest; answering in any other order would decide a prompt the user
+     * never saw.
+     */
     fun submit(decision: ApprovalDecision) {
-        deferred?.complete(decision)
+        val oldestSlot = synchronized(lock) {
+            parked.values.firstOrNull { !it.deferred.isCompleted }
+        } ?: return
+        oldestSlot.deferred.complete(decision)
     }
 
     /**
-     * Takes a parked prompt down without a real answer — the run was stopped, or
-     * the desktop resolved it. Completes fail-closed ([ApprovalDecision.REJECT])
-     * so a caller that reacts to the returned value can never mistake a
-     * disappeared prompt for consent.
+     * Answers one specific parked prompt, named the way the gateway names it
+     * (`request_id`).
+     *
+     * Falls back to matching the entry's key so a prompt parked without a
+     * `request_id` (keyed by run id, or by its own id) can still be targeted.
+     * Returns false when no live prompt matches, i.e. the caller's answer has
+     * nothing to settle.
+     */
+    fun submitFor(requestId: String, decision: ApprovalDecision): Boolean {
+        val match = synchronized(lock) {
+            parked.values.firstOrNull {
+                (it.parked.requestId == requestId || it.key == requestId) && !it.deferred.isCompleted
+            }
+        } ?: return false
+        return match.deferred.complete(decision)
+    }
+
+    /**
+     * Takes every parked prompt down without a real answer — the run was
+     * stopped, or the desktop resolved it. Completes fail-closed
+     * ([ApprovalDecision.REJECT]) so a caller that reacts to the returned value
+     * can never mistake a disappeared prompt for consent.
+     *
+     * *All* of them, not just the newest: leaving one pending is a caller
+     * suspended forever when the turn is cancelled.
      */
     fun cancel() {
-        deferred?.complete(ApprovalDecision.REJECT)
+        val all = synchronized(lock) { parked.values.toList() }
+        all.forEach { it.deferred.complete(ApprovalDecision.REJECT) }
+    }
+
+    /**
+     * Publishes the head of the queue unless a prompt is already on screen.
+     *
+     * Called after a park and after a settle, which is what makes the display
+     * FIFO: the second prompt is not pushed at a dialog that is still busy, it
+     * is shown when the first one leaves.
+     */
+    private fun publishHead() {
+        val next = synchronized(lock) {
+            // A stale key can only linger if its entry vanished without the
+            // finally block; treat that as "nothing displayed".
+            if (displayed != null && parked.containsKey(displayed)) return@synchronized null
+            displayed = null
+            val head = parked.values.firstOrNull { !it.deferred.isCompleted }
+                ?: return@synchronized null
+            displayed = head.key
+            head.parked
+        }
+        if (next != null) onPending(next.request)
     }
 }
 

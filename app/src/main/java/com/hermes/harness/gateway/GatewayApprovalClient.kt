@@ -35,6 +35,11 @@ class GatewayApprovalClient(private val http: OkHttpClient = shortTimeoutHttpCli
      * `approval_not_pending`, i.e. the prompt was already answered (from the
      * desktop, another client, or a retry) or it expired. Callers should close
      * quietly on [AlreadyResolved] instead of showing an error.
+     *
+     * Never throws: the base URL and the key come from free-form settings, and
+     * a URL `HttpUrl` rejects (or an unusable header value) is reported as a
+     * failed [Result] like any other transport problem, so a typo cannot crash
+     * the caller.
      */
     suspend fun respond(
         baseUrl: String,
@@ -48,14 +53,17 @@ class GatewayApprovalClient(private val http: OkHttpClient = shortTimeoutHttpCli
             if (requestId != null) put("request_id", requestId)
         }.toString()
 
-        val request = Request.Builder()
-            .url("${baseUrl.trimEnd('/')}/runs/$runId/approval")
-            .header("Authorization", "Bearer $apiKey")
-            .header("Content-Type", "application/json")
-            .post(payload.toRequestBody(JSON_MEDIA))
-            .build()
-
         try {
+            // Inside the guard on purpose: url() and the header setters throw
+            // IllegalArgumentException on free-form input, and that must come
+            // back as Result.failure rather than escape this function.
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/runs/$runId/approval")
+                .header("Authorization", "Bearer $apiKey")
+                .header("Content-Type", "application/json")
+                .post(payload.toRequestBody(JSON_MEDIA))
+                .build()
+
             http.newCall(request).execute().use { response ->
                 when {
                     response.isSuccessful -> Result.success(Unit)
@@ -76,6 +84,16 @@ class GatewayApprovalClient(private val http: OkHttpClient = shortTimeoutHttpCli
             }
         } catch (e: IOException) {
             Result.failure(e)
+        } catch (e: IllegalArgumentException) {
+            // A malformed base URL (or a key that cannot be a header value) is a
+            // settings mistake, not a crash: surface it in Portuguese the same
+            // way a transport error would be, with the cause kept for logs.
+            Result.failure(
+                IOException(
+                    "Endereço do gateway inválido. Confira a URL base nos ajustes.",
+                    e,
+                ),
+            )
         }
     }
 

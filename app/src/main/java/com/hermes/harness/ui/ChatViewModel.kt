@@ -289,18 +289,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      *
      * A prompt from the desktop is answered over HTTP — the desktop is the side
      * that is blocked — while a local tool call only needs its coroutine
-     * resumed. [GatewayApprovalGate.runId] tells the two apart.
+     * resumed. The gate publishes prompts FIFO, so the one on screen is
+     * [GatewayApprovalGate.oldest]; its own ids are used rather than the
+     * `attach` scalars, which a later frame may already have overwritten.
      */
     fun resolveApproval(decision: ApprovalDecision) {
         val request = _state.value.pendingApproval
-        val runId = gatewayGate.runId
-        if (runId != null) {
-            val choice = gatewayChoiceFor(decision, gatewayGate.choices)
-            val requestId = gatewayGate.requestId
+        val parked = gatewayGate.oldest
+        if (parked != null && parked.runId != null) {
+            val choice = gatewayChoiceFor(decision, parked.choices)
+            // submit() answers the oldest, which is exactly the parked entry read
+            // above, so the POST and the resumed coroutine agree on the prompt.
             gatewayGate.submit(decision)
-            gatewayGate.clear()
+            // Keep the frame ids while another prompt is still parked; its own
+            // entry carries what it needs, but a stale clear would be misleading.
+            if (gatewayGate.pendingCount == 0) gatewayGate.clear()
             _state.update { it.copy(pendingApproval = null) }
-            viewModelScope.launch { postDecision(runId, requestId, choice) }
+            viewModelScope.launch { postDecision(parked.runId, parked.requestId, choice) }
             return
         }
 
@@ -349,10 +354,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             is StreamEvent.GatewayApprovalResolved -> {
-                // Another prompt on the same run may be the one that was answered;
-                // only take ours down when the id matches (or was never told).
-                val mine = gatewayGate.requestId
-                if (event.requestId == null || mine == null || event.requestId == mine) {
+                val target = event.requestId
+                if (target != null) {
+                    // A named prompt: settle exactly that one, fail-closed, and
+                    // leave the others alone — cancel() would reject prompts the
+                    // desktop may still be waiting on.
+                    gatewayGate.submitFor(target, ApprovalDecision.REJECT)
+                } else {
+                    // No id to go by, so there is no way to tell which prompt
+                    // went away: take the whole queue down rather than leave a
+                    // dialog up for something already settled.
                     gatewayGate.cancel()
                     gatewayGate.clear()
                     _state.update { it.copy(pendingApproval = null) }
