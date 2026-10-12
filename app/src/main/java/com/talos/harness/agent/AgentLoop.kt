@@ -2,7 +2,7 @@ package com.talos.harness.agent
 
 import com.talos.harness.core.TalosJson
 import com.talos.harness.llm.ChatRequest
-import com.talos.harness.llm.DeepSeekClient
+import com.talos.harness.llm.ChatBackend
 import com.talos.harness.llm.StreamEvent
 import com.talos.harness.tools.ToolContext
 import com.talos.harness.tools.ToolRegistry
@@ -22,7 +22,7 @@ import kotlin.coroutines.cancellation.CancellationException
  * single source of truth for persisted state.
  */
 class AgentLoop(
-    private val client: DeepSeekClient,
+    private val client: ChatBackend,
     private val registry: ToolRegistry,
     private val approvals: ApprovalGate,
     private val toolContext: ToolContext,

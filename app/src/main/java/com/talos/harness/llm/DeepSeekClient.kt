@@ -28,7 +28,9 @@ import java.util.concurrent.TimeUnit
  * `data:` frame into a [StreamEvent]. Cancelling the collecting coroutine
  * cancels the HTTP call, because [ensureActive] runs between frames.
  */
-class DeepSeekClient(private val http: OkHttpClient = defaultHttpClient()) {
+class DeepSeekClient(
+    private val http: OkHttpClient = defaultHttpClient(),
+) : ChatBackend {
 
     /**
      * Sink for the gateway's own control frames (see [StreamEvent.GatewayApprovalRequested]).
@@ -42,7 +44,7 @@ class DeepSeekClient(private val http: OkHttpClient = defaultHttpClient()) {
      */
     var onGatewayEvent: ((StreamEvent) -> Unit)? = null
 
-    fun streamChat(
+    override fun streamChat(
         apiKey: String,
         baseUrl: String,
         request: ChatRequest,

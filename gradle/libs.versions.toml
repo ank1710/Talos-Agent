@@ -18,6 +18,12 @@ work = "2.12.0"
 serialization = "1.11.0"
 coroutines = "1.11.0"
 
+# LiteRT-LM runs a .litertlm bundle in-process, which is what lets the agent
+# work with no network at all. Its AAR ships no aar-metadata.properties, so it
+# declares no minCompileSdk and cannot cap compileSdk 36; its native code exists
+# only for arm64-v8a and x86_64. Both verified by unpacking the 0.18.0 AAR.
+litertlm = "0.18.0"
+
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
@@ -42,6 +48,10 @@ compose-material-icons-core = { group = "androidx.compose.material", name = "mat
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "serialization" }
 kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+
+# On-device inference. Pulls gson and kotlin-reflect transitively (both compile
+# scope in its POM); nothing here uses them directly.
+litertlm-android = { group = "com.google.ai.edge.litertlm", name = "litertlm-android", version.ref = "litertlm" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

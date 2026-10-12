@@ -37,6 +37,21 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Talos">
 
+        <!--
+          LiteRT-LM's GPU backend dlopen()s the vendor's OpenCL implementation at
+          runtime. Since Android 10 a native library from /vendor is only
+          dlopen-able if the app declares it here: without these two lines the
+          GPU attempt fails and every model falls back to the CPU. `required=false`
+          keeps the app installable on devices (and emulators) that have no
+          vendor OpenCL; DeviceCapability reports the same fact up front.
+        -->
+        <uses-native-library
+            android:name="libvndksupport.so"
+            android:required="false" />
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -80,4 +80,9 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
+
+    // Offline inference. The AAR carries liblitertlm_jni.so for arm64-v8a and
+    // x86_64 only (~48 MB of .so in the APK), so 32-bit ARM devices cannot run
+    // a local model; DeviceCapability reports that instead of failing at load.
+    implementation(libs.litertlm.android)
 }
