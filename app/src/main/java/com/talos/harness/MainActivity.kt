@@ -171,6 +171,12 @@ private fun TalosRoot(
             deviceRecommendation = state.deviceRecommendation,
             installedModels = state.installedModels,
             modelsDirectory = state.modelsDirectory,
+            selectedOnDeviceModel = state.onDeviceModel,
+            // The measurement lives beside the model it belongs to; the chat
+            // screen keeps only the active model's name in its top bar.
+            benchmarkResults = state.benchmarkResults,
+            benchmarkingModel = state.benchmarkingModel,
+            benchmarkStage = state.benchmarkStage,
             onApiKeyChange = viewModel::updateApiKey,
             onProviderChange = viewModel::selectProvider,
             onBaseUrlChange = viewModel::updateBaseUrl,
@@ -182,6 +188,9 @@ private fun TalosRoot(
             onUsePc = viewModel::useDesktopBridge,
             onUseOnDevice = viewModel::useOnDeviceModel,
             onRefreshModels = viewModel::refreshInstalledModels,
+            onSelectOnDeviceModel = viewModel::selectOnDeviceModel,
+            onBenchmarkModel = viewModel::benchmarkModel,
+            onCancelBenchmark = viewModel::cancelBenchmark,
             onFetchModels = viewModel::fetchModels,
             onTestConnection = viewModel::testConnection,
             onRevokeApproval = viewModel::revokeApproval,

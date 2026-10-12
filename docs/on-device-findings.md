@@ -71,9 +71,41 @@ phone-shaped jobs.
    repoints the model field to `ModelStore.default(recommendation)`. Editing the field
    afterwards is overwritten on the next start. So someone who wants to try the 1.9 GB
    model — accepting the risk — cannot. A "force this model" affordance is missing.
+   **Addressed** — see "Model override and a real speed benchmark" below.
 4. **`supportsVision` is false for `.litertlm` names**, so attaching an image in on-device
    mode shows the "switch to deepseek-flash" hint. Honest, but it means a multimodal local
    model would need this to become capability-driven rather than name-driven.
+
+## Model override and a real speed benchmark
+
+Added after that round, and **not yet run on a device** — nothing below is a measurement.
+
+The probe answers "does this fit in RAM?" from memory, and it is deliberately pessimistic
+(weights may be a mapping the kernel can evict). Nothing answered "is this actually
+usable?", so Settings → "Onde roda o modelo" now lists every installed bundle and lets the
+user select one — including one above the measured budget, with a warning on its row — and
+measure it with `ModelBenchmark.kt`: release, load, generate a fixed prompt with a fixed
+output cap, report, then put back whatever was loaded before.
+
+`getTokenCount()` is still the only token count LiteRT-LM exposes through this seam, and it
+is KV-cache occupancy with no prompt/completion split, so the speed figure is published as
+a **ceiling** ("no máximo"), with its basis printed next to it in the UI; a character-based
+estimate is the fallback when the occupancy is not consistent with the text that arrived,
+and no figure at all when neither is honest. `benchmark()` returns that basis as data, so
+the number cannot reach the screen without it.
+
+Two things worth knowing for whoever runs this first:
+
+- The exact prefill/decode timers do exist (`Conversation.getBenchmarkInfo()`,
+  `@ExperimentalApi`), but the native library logs *"Benchmark is not enabled. Please make
+  sure the BenchmarkParams is set in the EngineSettings."* — they need
+  `ExperimentalFlags.enableBenchmark = true` before `Engine.initialize()`. That flag was
+  deliberately **not** switched on: it changes engine behaviour for ordinary chat
+  (it appears to wait for weight conversion) and could not be verified on hardware, which
+  is exactly the kind of change that should not ride along with a measurement feature.
+- The old frustration should be gone: entering on-device mode no longer overwrites a model
+  the user picked from the list, so the 1.9 GB Gemma can now be selected, measured, and
+  left in place.
 
 ## Not verified
 
@@ -84,3 +116,45 @@ still an open question. Weights may be mmapped rather than fully resident, so th
 could be pessimistic — that is exactly the kind of claim only a real run settles.
 
 Nothing here ran through the desktop gateway or WorkManager.
+
+## Measured benchmark (first real run)
+
+Run on the device from Ajustes → "Onde roda o modelo" → "Medir velocidade". Fixed prompt,
+96-token cap, temperature 0. The figure is a **ceiling** and the UI says so next to it:
+it is KV occupancy at the end of the conversation (preface + prompt + answer) divided by
+generation time, because LiteRT exposes no prompt/completion split.
+
+| Model | Load | Generate | Backend | Speed | Outcome |
+|---|---|---|---|---|---|
+| `mobile-actions_q8_ekv1024.litertlm` (271 MB) | **290 ms** | 116 chars in **1.6 s** | CPU | **78.8 tok/s** (ceiling) | OK |
+| `gemma-4-E2B-it-gpu.litertlm` (1.9 GB) | 217 ms | 0 chars | — | not measurable | **FAILED_TO_LOAD** |
+
+So the working model loads in about a third of a second and answers a short prompt in
+under two seconds, on CPU and with no network. That is a usable local agent, not a demo.
+
+### The large model's failure is NOT about RAM — and the probe was not wrong
+
+217 ms and this from the native library:
+
+```
+Failed to create engine: NOT_FOUND:
+  └ llm_litert_compiled_model_executor_factory.cc:91
+  └ tf_lite_prefill_decode not found in the model.
+```
+
+The bundle does not contain the `tf_lite_prefill_decode` section the **CPU** executor
+needs. `mobile-actions_q8_ekv1024.litertlm` does contain it — the string is visible in its
+header.
+
+**The mistake was mine, in model selection:** `gemma-4-E2B-it-gpu.litertlm` is the
+GPU-specific artifact, and the probe had chosen the **CPU** backend (not enough free RAM
+for the OpenCL driver). A GPU-only bundle cannot serve a CPU backend.
+
+So this run does **not** answer whether a 1.9 GB model fits in this phone's memory. It
+answers a different and cheaper question: that bundle was never loadable here at all.
+The generic `gemma-4-E2B-it.litertlm` (2.4 GB) is the artifact that would test the RAM
+question, and it is the next experiment.
+
+This is exactly what a real measurement buys over a theoretical estimate: the probe
+predicted "won't fit"; the benchmark showed "won't load, for an unrelated reason, in
+217 ms".

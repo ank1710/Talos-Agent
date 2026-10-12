@@ -25,6 +25,7 @@ import com.talos.harness.llm.ChatBackend
 import com.talos.harness.llm.DeepSeekClient
 import com.talos.harness.llm.StreamEvent
 import com.talos.harness.llm.WireUsage
+import com.talos.harness.local.BenchmarkResult
 import com.talos.harness.local.DeviceCapability
 import com.talos.harness.local.DeviceProfile
 import com.talos.harness.local.LocalBackend
@@ -32,6 +33,7 @@ import com.talos.harness.local.ModelFile
 import com.talos.harness.local.ModelRecommendation
 import com.talos.harness.local.ModelStore
 import com.talos.harness.local.OnDeviceBackend
+import com.talos.harness.local.benchmark
 import com.talos.harness.media.MediaResolver
 import com.talos.harness.schedule.ScheduleScheduler
 import com.talos.harness.schedule.ScheduledTask
@@ -64,6 +66,7 @@ import com.talos.harness.voice.VoiceController
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -115,8 +118,28 @@ data class ChatUiState(
      * reason for the backend and size class the phone was given.
      */
     val deviceRecommendation: ModelRecommendation? = null,
+    /**
+     * Name of the bundle being measured right now, or null when idle. The row
+     * for this model shows the progress and the cancel button.
+     */
+    val benchmarkingModel: String? = null,
+    /** What the benchmark is doing, in Portuguese, for the row above. */
+    val benchmarkStage: String? = null,
+    /**
+     * Last measurement per model name. Keyed by name, not by [ModelFile],
+     * because the list is re-read from disk and two reads of the same bundle
+     * must land on the same entry.
+     */
+    val benchmarkResults: Map<String, BenchmarkResult> = emptyMap(),
 ) {
     val needsSetup: Boolean get() = !settings.isConfigured
+
+    /**
+     * The bundle the phone is told to load: [TalosSettings.model] read through
+     * the state. It is the user's explicit choice when they made one — including
+     * one the capability probe rejects — and the automatic choice otherwise.
+     */
+    val onDeviceModel: String get() = settings.model
 
     /** True when the weights run on this phone. */
     val onDevice: Boolean get() = settings.mode == ModelMode.ON_DEVICE
@@ -273,6 +296,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var runJob: Job? = null
     private var modelFetchJob: Job? = null
+    private var benchmarkJob: Job? = null
     private var approvalDeferred: CompletableDeferred<ApprovalDecision>? = null
 
     /** Mirrors the persisted allowlist so the gate can answer without I/O. */
@@ -365,6 +389,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // The engine holds native memory; a view model teardown that dropped the
         // reference without closing would keep the model's mapping alive in a
         // process Android already treats as tight.
+        benchmarkJob?.cancel()
         onDeviceEngine.release()
         super.onCleared()
     }
@@ -1001,23 +1026,133 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val (directory, installed) = withContext(Dispatchers.IO) {
                 modelStore.directory().absolutePath to modelStore.installed()
             }
-            val chosen = modelStore.default(recommendation)
+            // A model the user forced earlier wins over the automatic pick. The
+            // whole point of forcing one is that the probe's advice is not the
+            // last word, and re-pointing the field on every mode switch would
+            // undo that choice exactly the way the old behaviour did.
+            val forced = installed.firstOrNull {
+                it.name.equals(_state.value.settings.model.trim(), ignoreCase = true)
+            }
+            val chosen = forced ?: modelStore.default(recommendation)
             settingsRepo.setMode(ModelMode.ON_DEVICE)
             chosen?.let { settingsRepo.setModel(it.name) }
+            val overBudget = chosen != null &&
+                recommendation != null &&
+                chosen.bytes > recommendation.modelFileBudgetBytes
             _state.update {
                 it.copy(
                     installedModels = installed,
                     modelsDirectory = directory,
                     deviceRecommendation = recommendation,
-                    statusMessage = if (chosen == null) {
-                        "Modo no celular ativado, mas nenhum modelo está instalado."
-                    } else {
-                        "Rodando no celular: ${chosen.name}."
+                    statusMessage = when {
+                        chosen == null ->
+                            "Modo no celular ativado, mas nenhum modelo está instalado."
+
+                        overBudget ->
+                            "Rodando no celular: ${chosen.name} — acima do orçamento medido; " +
+                                "pode ser morto pelo sistema ou falhar ao carregar."
+
+                        else -> "Rodando no celular: ${chosen.name}."
                     },
                     statusIsError = chosen == null,
                 )
             }
         }
+    }
+
+    /**
+     * Forces one installed bundle, whatever the probe says about it.
+     *
+     * This is the escape hatch the capability probe must not close: its weight
+     * budget is half the measured headroom, deliberately, so it rejects models
+     * that might still run — the weights are a file mapping the kernel can
+     * evict. Selecting here is an explicit acceptance of that risk (the row
+     * carries the warning), and it is persisted, so it survives a restart
+     * instead of being overwritten by [useOnDeviceModel]'s automatic pick.
+     */
+    fun selectOnDeviceModel(name: String) {
+        val model = _state.value.installedModels.firstOrNull { it.name == name } ?: return
+        viewModelScope.launch {
+            // The list only exists under ON_DEVICE, but setting the mode here
+            // keeps the invariant if that ever changes: choosing a local bundle
+            // means the phone runs it.
+            settingsRepo.setMode(ModelMode.ON_DEVICE)
+            settingsRepo.setModel(model.name)
+            _state.update {
+                it.copy(
+                    statusMessage = "Modelo escolhido: ${model.name} (${model.sizeLabel}).",
+                    statusIsError = false,
+                )
+            }
+        }
+    }
+
+    /**
+     * Measures one installed model for real: unload, load, generate, put back.
+     *
+     * Refused while a turn is streaming, because the benchmark releases the
+     * engine and closing one mid-decode is not something a measurement should be
+     * able to do to a conversation. A previous measurement is joined rather than
+     * merely cancelled, so its cleanup — including putting the previous model
+     * back — has finished before this one touches the engine.
+     */
+    fun benchmarkModel(name: String) {
+        val model = _state.value.installedModels.firstOrNull { it.name == name }
+        if (model == null) {
+            _state.update { it.copy(statusMessage = "Modelo não encontrado: $name", statusIsError = true) }
+            return
+        }
+        if (_state.value.isRunning) {
+            _state.update {
+                it.copy(
+                    statusMessage = "Espere a resposta atual terminar antes de medir a velocidade.",
+                    statusIsError = true,
+                )
+            }
+            return
+        }
+
+        val previous = benchmarkJob
+        benchmarkJob = viewModelScope.launch {
+            previous?.cancelAndJoin()
+            _state.update { it.copy(benchmarkingModel = model.name, benchmarkStage = "Preparando…") }
+            try {
+                val result = benchmark(
+                    model = model,
+                    backend = onDeviceEngine,
+                    // The same accelerator preference a turn would use, so the
+                    // measurement describes this app's real path, not a
+                    // synthetic one.
+                    accelerator = deviceProfile?.recommendation?.backend ?: LocalBackend.GPU,
+                ) { stage -> _state.update { it.copy(benchmarkStage = stage) } }
+                _state.update { it.copy(benchmarkResults = it.benchmarkResults + (model.name to result)) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // `benchmark` classifies load and generation failures itself, so
+                // reaching here means something outside them — but an uncaught
+                // exception in a viewModelScope launch takes the app down, which
+                // a measurement must never do.
+                _state.update {
+                    it.copy(
+                        statusMessage = "A medição falhou: ${e.message ?: "erro inesperado"}",
+                        statusIsError = true,
+                    )
+                }
+            } finally {
+                _state.update { it.copy(benchmarkingModel = null, benchmarkStage = null) }
+            }
+        }
+    }
+
+    /**
+     * Stops a running measurement. Its own cleanup releases the engine, which is
+     * reloaded before the next turn streams — a cancelled benchmark must not
+     * leave the conversation without a model.
+     */
+    fun cancelBenchmark() {
+        benchmarkJob?.cancel()
+        benchmarkJob = null
     }
 
     fun updateGatewayApiKey(value: String) = viewModelScope.launch { settingsRepo.setGatewayApiKey(value) }

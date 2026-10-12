@@ -58,8 +58,13 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.talos.harness.local.BenchmarkOutcome
+import com.talos.harness.local.BenchmarkResult
 import com.talos.harness.local.ModelFile
 import com.talos.harness.local.ModelRecommendation
+import com.talos.harness.local.formatBytes
+import com.talos.harness.local.formatDuration
+import com.talos.harness.local.formatTokensPerSecond
 import com.talos.harness.store.ModelMode
 import com.talos.harness.store.ProviderCatalog
 import com.talos.harness.store.ProviderModel
@@ -107,6 +112,13 @@ private enum class SettingsSection(val title: String) {
  * @param deviceRecommendation what the hardware probe measured; `null` when the
  *   probe itself failed, in which case ON_DEVICE must stay selectable.
  * @param installedModels `.litertlm` bundles on disk, shown under "Onde roda".
+ * @param selectedOnDeviceModel the bundle the phone loads now, including one the
+ *   user forced against the probe's advice; the list marks it with a check.
+ * @param benchmarkResults the last real measurement of each model, keyed by
+ *   name. Shown next to the model it belongs to, together with the basis of its
+ *   speed figure.
+ * @param benchmarkingModel the model being measured right now, or `null`.
+ * @param benchmarkStage what the running measurement is doing, in Portuguese.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -119,6 +131,15 @@ fun SettingsScreen(
     deviceRecommendation: ModelRecommendation?,
     installedModels: List<ModelFile>,
     modelsDirectory: String,
+    /**
+     * The bundle the phone is told to load right now — the user's forced choice
+     * when they made one. Passed separately from [settings] so the screen never
+     * has to decide for itself which field names the on-device model.
+     */
+    selectedOnDeviceModel: String,
+    benchmarkResults: Map<String, BenchmarkResult>,
+    benchmarkingModel: String?,
+    benchmarkStage: String?,
     onApiKeyChange: (String) -> Unit,
     onProviderChange: (String) -> Unit,
     onBaseUrlChange: (String) -> Unit,
@@ -130,6 +151,9 @@ fun SettingsScreen(
     onUsePc: () -> Unit,
     onUseOnDevice: () -> Unit,
     onRefreshModels: () -> Unit,
+    onSelectOnDeviceModel: (String) -> Unit,
+    onBenchmarkModel: (String) -> Unit,
+    onCancelBenchmark: () -> Unit,
     onFetchModels: () -> Unit,
     onTestConnection: () -> Unit,
     onRevokeApproval: (String) -> Unit,
@@ -195,10 +219,17 @@ fun SettingsScreen(
                     recommendation = deviceRecommendation,
                     models = installedModels,
                     directory = modelsDirectory,
+                    selectedModel = selectedOnDeviceModel,
+                    benchmarkResults = benchmarkResults,
+                    benchmarkingModel = benchmarkingModel,
+                    benchmarkStage = benchmarkStage,
                     onUseCloud = onUseCloud,
                     onUsePc = onUsePc,
                     onUseOnDevice = onUseOnDevice,
                     onRefreshModels = onRefreshModels,
+                    onSelectModel = onSelectOnDeviceModel,
+                    onBenchmarkModel = onBenchmarkModel,
+                    onCancelBenchmark = onCancelBenchmark,
                 )
 
                 SettingsSection.CONNECTION -> ConnectionSection(
@@ -367,10 +398,17 @@ private fun RuntimeSection(
     recommendation: ModelRecommendation?,
     models: List<ModelFile>,
     directory: String,
+    selectedModel: String,
+    benchmarkResults: Map<String, BenchmarkResult>,
+    benchmarkingModel: String?,
+    benchmarkStage: String?,
     onUseCloud: () -> Unit,
     onUsePc: () -> Unit,
     onUseOnDevice: () -> Unit,
     onRefreshModels: () -> Unit,
+    onSelectModel: (String) -> Unit,
+    onBenchmarkModel: (String) -> Unit,
+    onCancelBenchmark: () -> Unit,
 ) {
     val palette = TalosColors.current
 
@@ -485,40 +523,207 @@ private fun RuntimeSection(
                 color = palette.caution,
             )
         } else {
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(14.dp),
-                color = palette.surfaceElevated,
-                contentColor = palette.textPrimary,
+            Text(
+                text = "Toque em um modelo para rodar nele. A memória medida é uma " +
+                    "estimativa: um modelo acima do orçamento pode até rodar, porque os " +
+                    "pesos são um arquivo mapeado que o sistema pode descartar — ou pode " +
+                    "ser morto ao carregar.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.textSecondary,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            models.forEach { model ->
+                OnDeviceModelRow(
+                    model = model,
+                    selected = model.name == selectedModel.trim(),
+                    // The probe's budget is a file-size budget: anything above it
+                    // is exactly the case this screen exists to let the user try.
+                    overBudget = recommendation?.takeIf { model.bytes > it.modelFileBudgetBytes },
+                    result = benchmarkResults[model.name],
+                    running = benchmarkingModel == model.name,
+                    stage = benchmarkStage,
+                    // One measurement at a time: the engine is a single shared
+                    // resource and a second run would fight the first for RAM.
+                    anyRunning = benchmarkingModel != null,
+                    onSelect = { onSelectModel(model.name) },
+                    onBenchmark = { onBenchmarkModel(model.name) },
+                    onCancel = onCancelBenchmark,
+                )
+            }
+        }
+    }
+}
+
+/**
+ * One installed bundle: its size, whether it is the one in use, the warning if
+ * the probe rejected it, its last measurement, and the actions.
+ *
+ * The whole row selects; the buttons are the only other targets, so a mis-tap
+ * costs a selection (reversible, and the check mark shows it) rather than an
+ * unannounced multi-minute measurement.
+ */
+@Composable
+private fun OnDeviceModelRow(
+    model: ModelFile,
+    selected: Boolean,
+    overBudget: ModelRecommendation?,
+    result: BenchmarkResult?,
+    running: Boolean,
+    stage: String?,
+    anyRunning: Boolean,
+    onSelect: () -> Unit,
+    onBenchmark: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    val palette = TalosColors.current
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .clickable(enabled = !running) { onSelect() },
+        shape = RoundedCornerShape(14.dp),
+        color = if (selected) palette.surfaceVariant else palette.surfaceElevated,
+        contentColor = palette.textPrimary,
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = if (selected) "Em uso" else null,
+                    tint = if (selected) palette.brand else palette.background.copy(alpha = 0f),
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = model.name,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontFamily = FontFamily.Monospace,
+                        color = palette.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = if (selected) "${model.sizeLabel} · em uso" else model.sizeLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (selected) palette.brandInk else palette.textFaint,
+                    )
+                }
+            }
+
+            if (overBudget != null) {
+                Text(
+                    text = "Acima do orçamento medido (${formatBytes(overBudget.modelFileBudgetBytes)}). " +
+                        "Pode ser morto pelo sistema ou falhar ao carregar — dá para tentar e medir.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.caution,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+
+            if (result != null) {
+                BenchmarkResultBlock(result = result, modifier = Modifier.padding(top = 10.dp))
+            }
+
+            if (running) {
+                Row(
+                    modifier = Modifier.padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = palette.brand,
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = stage ?: "Medindo…",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.textSecondary,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.padding(top = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)) {
-                    models.forEach { model ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                text = model.name,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontFamily = FontFamily.Monospace,
-                                color = palette.textPrimary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = model.sizeLabel,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = palette.textFaint,
-                            )
-                        }
+                TextButton(onClick = onBenchmark, enabled = !anyRunning) {
+                    Text(text = if (result == null) "Medir velocidade" else "Medir de novo")
+                }
+                if (running) {
+                    TextButton(onClick = onCancel) {
+                        Text(text = "Cancelar")
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * One measurement, with its basis stated next to the number.
+ *
+ * The speed line always carries [BenchmarkResult.speedBasis]'s label, so a
+ * tokens/s figure can never appear here as if it were exact: LiteRT-LM exposes
+ * no prompt/completion split, and the label says which approximation produced
+ * the number.
+ */
+@Composable
+private fun BenchmarkResultBlock(
+    result: BenchmarkResult,
+    modifier: Modifier = Modifier,
+) {
+    val palette = TalosColors.current
+    val accent = when (result.outcome) {
+        BenchmarkOutcome.OK -> palette.success
+        BenchmarkOutcome.SLOW -> palette.caution
+        BenchmarkOutcome.FAILED_TO_LOAD, BenchmarkOutcome.ERROR -> palette.danger
+    }
+
+    Column(modifier = modifier) {
+        Text(
+            text = result.outcome.label,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Medium,
+            color = accent,
+        )
+        Text(
+            text = buildString {
+                append("Carregou em ")
+                append(formatDuration(result.loadMs))
+                append(" · gerou em ")
+                append(formatDuration(result.generateMs))
+                append(" (")
+                append(result.outputChars)
+                append(" caracteres)")
+                result.backend?.let {
+                    append(" · ")
+                    append(it.name)
+                }
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = palette.textSecondary,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+        Text(
+            text = result.approxTokensPerSecond?.let {
+                "${formatTokensPerSecond(it)} tokens/s — ${result.speedBasis.label}"
+            } ?: result.speedBasis.label,
+            style = MaterialTheme.typography.labelSmall,
+            color = palette.textFaint,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+        Text(
+            text = result.detail,
+            style = MaterialTheme.typography.labelSmall,
+            color = palette.textFaint,
+            modifier = Modifier.padding(top = 4.dp),
+        )
     }
 }
 
