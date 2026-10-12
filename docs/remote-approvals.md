@@ -74,6 +74,35 @@ The work is therefore: a gateway approval transport (parse the event, POST the
 decision), a second `ApprovalGate`, and surfacing it in the UI as a notification
 with actions so it can be answered from the shade.
 
+## Live verification attempt — did NOT reach the approval path
+
+The feature is implemented and compiles (`dcc3af8`), but the first live attempt to
+verify it end to end **failed to trigger a gate**, so it remains runtime-unverified.
+
+What was tried: PC mode on, gateway key present, `adb reverse tcp:8642` up, and the
+prompt *"Escreva um arquivo AGENTS.md com o texto teste na pasta de trabalho"*.
+
+What happened: the desktop agent wrote
+`/Users/leonardozanattaribeiro/Desktop/Code/hermes-bridge/cache/scratch/AGENTS.md`
+and reported success. **No `approval.request` was emitted**, so no prompt reached
+the phone.
+
+Two facts worth carrying forward:
+
+1. **The gate is location- or context-sensitive in a way not yet characterised.**
+   The research probe *did* trip it with an `AGENTS.md` under `/tmp`, reporting
+   `pattern_key: protected_instruction_file`. The same filename under the gateway's
+   own scratch directory did not. Until that difference is understood, a test that
+   lets the agent choose the location is not a test of the approval path.
+2. **The desktop agent cannot write to its own working directory here** — it
+   reported `Operation not permitted` for `/Users/leonardozanattaribeiro` and fell
+   back to its scratch dir. That constrains which paths a phone-driven request can
+   even reach.
+
+To verify properly, the prompt must force a path that matches the protected
+pattern (the probe's approach: a throwaway `AGENTS.md` in a fresh temp directory),
+rather than describing the file and letting the agent pick.
+
 ## Gateway-side policy worth knowing
 
 - The server-side agent's toolsets come from `platform_toolsets.api_server`
