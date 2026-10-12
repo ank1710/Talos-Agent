@@ -138,14 +138,14 @@ class AgentLoop(
 
                 emit(AgentEvent.ToolStarted(messageId, call))
 
-                if (tool.risk != Risk.SAFE) {
-                    val approval = ApprovalRequest(
-                        id = newId(),
-                        toolName = tool.name,
-                        arguments = call.arguments,
-                        preview = runCatchingCancellable { tool.preview(args) }.getOrDefault(tool.name),
-                        risk = tool.risk,
-                    )
+                val approval = ApprovalRequest(
+                    id = newId(),
+                    toolName = tool.name,
+                    arguments = call.arguments,
+                    preview = runCatchingCancellable { tool.preview(args) }.getOrDefault(tool.name),
+                    risk = tool.risk,
+                )
+                if (approvals.requiresApproval(approval)) {
                     emit(AgentEvent.ApprovalRequired(approval))
                     val decision = approvals.request(approval)
                     emit(AgentEvent.ApprovalResolved(approval.id, decision))

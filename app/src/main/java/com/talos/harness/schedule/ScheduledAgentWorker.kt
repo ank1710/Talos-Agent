@@ -308,8 +308,9 @@ class ScheduledAgentWorker(
  * The interactive gate suspends on a `CompletableDeferred` until a human taps a
  * button. Reusing it here would park the worker until WorkManager's timeout and
  * then let a humanless run execute nothing — or worse, everything. So the policy
- * is baked in instead: do what is provably harmless, do the mildly risky things
- * only when the user opted this task into them, and refuse the rest outright.
+ * is baked in instead: only explicitly named tools can run, and the sensitive
+ * subset also requires the task's opt-in. Fail-closed is the point: a future
+ * tool is denied until its name is deliberately reviewed here.
  *
  * Refusal is not an error path: [AgentLoop] feeds the rejection back to the model
  * as a tool result, so the model can propose a safer route in the same run.
@@ -318,27 +319,41 @@ private class UnattendedApprovalGate(
     private val allowSensitiveTools: Boolean,
 ) : ApprovalGate {
 
-    override suspend fun request(request: ApprovalRequest): ApprovalDecision = when (request.risk) {
-        // Read-only or otherwise reversible: safe to do with nobody looking.
-        Risk.SAFE -> ApprovalDecision.APPROVE_ONCE
+    // Scheduled runs must consult this policy for every call, even one marked SAFE.
+    override fun requiresApproval(request: ApprovalRequest): Boolean = true
 
-        // Shell commands, file writes, opening URLs, reading the clipboard.
-        // These are the ones the user explicitly opted into per task.
-        Risk.CAUTION -> if (allowSensitiveTools) {
-            ApprovalDecision.APPROVE_ONCE
-        } else {
-            ApprovalDecision.REJECT
+    override suspend fun request(request: ApprovalRequest): ApprovalDecision {
+        val allowed = when {
+            request.risk == Risk.DANGEROUS -> false
+            request.toolName in ALWAYS_ALLOWED_TOOLS -> true
+            allowSensitiveTools && request.toolName in SENSITIVE_OPT_IN_TOOLS -> true
+            else -> false
         }
-
-        // No unattended path, not even with `allowSensitiveTools`. The flag is
-        // there to let a task be useful, not to remove every boundary from
-        // something the user cannot interrupt.
-        Risk.DANGEROUS -> ApprovalDecision.REJECT
+        return if (allowed) ApprovalDecision.APPROVE_ONCE else ApprovalDecision.REJECT
     }
 
     // Overridden only so a code search for the approval interface finds no
     // toString that could print arguments into a log.
     override fun toString(): String = "UnattendedApprovalGate(allowSensitiveTools=$allowSensitiveTools)"
+
+    private companion object {
+        // This narrow tool reports basic device state; private-data readers stay out.
+        val ALWAYS_ALLOWED_TOOLS = setOf("device_info")
+
+        // These require the user's explicit per-task opt-in.
+        // contacts_search, calendar_read and clipboard_read are intentionally absent.
+        val SENSITIVE_OPT_IN_TOOLS = setOf(
+            "shell",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "fetch_url",
+            "notify",
+            "clipboard_write",
+            "open_url",
+            "list_apps",
+        )
+    }
 }
 
 /**

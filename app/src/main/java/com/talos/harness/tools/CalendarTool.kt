@@ -36,7 +36,7 @@ class CalendarReadTool : Tool {
         "query" to Schema.string("Filtro opcional por texto no título do compromisso."),
     )
 
-    override val risk = Risk.SAFE
+    override val risk = Risk.CAUTION
 
     override fun preview(args: JsonObject): String =
         "Ler a agenda dos próximos ${Args.int(args, "days") ?: 7} dias"

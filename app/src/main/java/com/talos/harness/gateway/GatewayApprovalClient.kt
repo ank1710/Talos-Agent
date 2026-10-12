@@ -1,15 +1,20 @@
 package com.talos.harness.gateway
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
 /**
  * Sends the user's answer back to a prompt the *desktop* agent raised.
@@ -47,24 +52,27 @@ class GatewayApprovalClient(private val http: OkHttpClient = shortTimeoutHttpCli
         runId: String,
         choice: String,
         requestId: String? = null,
-    ): Result<Unit> = withContext(Dispatchers.IO) {
+    ): Result<Unit> {
+        if (runId.isBlank() || apiKey.isBlank()) {
+            return Result.failure(IOException("Identificador ou chave do gateway ausente."))
+        }
         val payload = buildJsonObject {
             put("choice", choice)
             if (requestId != null) put("request_id", requestId)
         }.toString()
 
-        try {
+        return try {
             // Inside the guard on purpose: url() and the header setters throw
             // IllegalArgumentException on free-form input, and that must come
             // back as Result.failure rather than escape this function.
             val request = Request.Builder()
-                .url("${baseUrl.trimEnd('/')}/runs/$runId/approval")
+                .url(runEndpoint(baseUrl, runId, "approval"))
                 .header("Authorization", "Bearer $apiKey")
                 .header("Content-Type", "application/json")
                 .post(payload.toRequestBody(JSON_MEDIA))
                 .build()
 
-            http.newCall(request).execute().use { response ->
+            http.newCall(request).awaitResponse().use { response ->
                 when {
                     response.isSuccessful -> Result.success(Unit)
 
@@ -97,6 +105,31 @@ class GatewayApprovalClient(private val http: OkHttpClient = shortTimeoutHttpCli
         }
     }
 
+    /** Stops the desktop run captured by the active chat turn. */
+    suspend fun stopRun(baseUrl: String, apiKey: String, runId: String): Result<Unit> {
+        if (runId.isBlank() || apiKey.isBlank()) {
+            return Result.failure(IOException("Identificador ou chave do gateway ausente."))
+        }
+        return try {
+            val request = Request.Builder()
+                .url(runEndpoint(baseUrl, runId, "stop"))
+                .header("Authorization", "Bearer $apiKey")
+                .post(ByteArray(0).toRequestBody(null))
+                .build()
+            http.newCall(request).awaitResponse().use { response ->
+                if (response.isSuccessful) {
+                    Result.success(Unit)
+                } else {
+                    Result.failure(IOException("O PC recusou o cancelamento (HTTP ${response.code})."))
+                }
+            }
+        } catch (e: IOException) {
+            Result.failure(e)
+        } catch (e: IllegalArgumentException) {
+            Result.failure(IOException("Endereço do gateway inválido. Confira a URL base nos ajustes.", e))
+        }
+    }
+
     /**
      * The prompt is no longer pending — someone else answered it, or it timed
      * out. Distinguishable so the UI can treat it as "already handled" rather
@@ -116,4 +149,37 @@ class GatewayApprovalClient(private val http: OkHttpClient = shortTimeoutHttpCli
             .retryOnConnectionFailure(true)
             .build()
     }
+}
+
+/** Canonical origin only, used to keep a queued approval with its run's host. */
+fun gatewayOrigin(baseUrl: String): String? = baseUrl.toHttpUrlOrNull()?.let { url ->
+    val host = if (':' in url.host) "[${url.host}]" else url.host
+    "${url.scheme}://$host:${url.port}"
+}
+
+private fun runEndpoint(baseUrl: String, runId: String, action: String): HttpUrl {
+    require(runId.isNotBlank()) { "run_id ausente" }
+    val base = baseUrl.toHttpUrlOrNull() ?: throw IllegalArgumentException("URL base inválida")
+    return base.newBuilder()
+        .encodedPath(base.encodedPath.trimEnd('/').ifEmpty { "/" })
+        .query(null)
+        .fragment(null)
+        .addPathSegment("runs")
+        .addPathSegment(runId)
+        .addPathSegment(action)
+        .build()
+}
+
+/** Cancellable continuation owns the OkHttp call so cancellation stops its network I/O. */
+private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation { cancel() }
+    enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            if (continuation.isActive) continuation.resumeWith(Result.failure(e))
+        }
+
+        override fun onResponse(call: Call, response: Response) {
+            continuation.resume(response) { _, abandoned, _ -> abandoned.close() }
+        }
+    })
 }

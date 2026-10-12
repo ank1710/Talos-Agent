@@ -26,14 +26,15 @@ data class ToolResult(
  * A capability the model can invoke.
  *
  * [risk] drives the approval flow: anything above [Risk.SAFE] pauses the loop
- * until the user confirms. [preview] is what the confirmation sheet shows, so
- * it should read like a sentence a human can judge at a glance.
+ * until the user confirms. New tools default to [Risk.CAUTION] so an omitted
+ * classification cannot silently bypass approval. [preview] is what the
+ * confirmation sheet shows, so it should read like a sentence a human can judge.
  */
 interface Tool {
     val name: String
     val description: String
     val parameters: JsonObject
-    val risk: Risk get() = Risk.SAFE
+    val risk: Risk get() = Risk.CAUTION
 
     fun preview(args: JsonObject): String = name
 

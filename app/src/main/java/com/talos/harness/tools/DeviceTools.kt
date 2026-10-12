@@ -74,6 +74,8 @@ class ClipboardWriteTool : Tool {
         required = listOf("text"),
     )
 
+    override val risk = Risk.CAUTION
+
     override fun preview(args: JsonObject): String =
         "Copiar ${Args.string(args, "text")?.length ?: 0} caracteres para a área de transferência"
 
@@ -164,6 +166,21 @@ class OpenUrlTool : Tool {
 class DeviceInfoTool : Tool {
 
     override val name = "device_info"
+
+    /**
+     * SAFE deliberately, not by omission.
+     *
+     * The default is now CAUTION so that an unclassified tool cannot bypass
+     * approval. This one earns the exception: it reads coarse device state
+     * (battery, storage, network, screen) and nothing personal. Prompting for it
+     * would be worse than useless — it fires on almost every turn, and an
+     * approval dialog that appears constantly is one the user learns to dismiss
+     * without reading, which costs more safety than it buys.
+     *
+     * Contrast contacts and calendar, which stayed CAUTION: those are personal
+     * data whose content leaves the device in the next request.
+     */
+    override val risk = Risk.SAFE
     override val description = """
         Devolve o estado do aparelho: bateria (nível, carregando, temperatura),
         armazenamento livre, tipo de conexão, tela, tempo ligado e versão do Android.

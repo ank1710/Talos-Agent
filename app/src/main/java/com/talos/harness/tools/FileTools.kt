@@ -7,16 +7,24 @@ import kotlinx.serialization.json.JsonObject
 import java.io.File
 
 /**
- * Resolves a model-supplied path.
+ * Resolves a model-supplied path inside the one directory exposed to file tools.
  *
- * Relative paths land inside the agent workspace; absolute paths are honoured
- * so the agent can reach the rest of the device when the user grants it. The
- * approval gate, not this function, is what keeps that honest.
+ * Shared storage (`/sdcard`) and other app-private files remain unreachable:
+ * fetched/shared prompt injection must not turn file tools into a path to secrets.
  */
 internal fun resolvePath(ctx: ToolContext, raw: String): File {
-    val file = File(raw)
-    return if (file.isAbsolute) file else File(ctx.workspace, raw)
+    val root = ctx.workspace.canonicalFile
+    val supplied = File(raw)
+    val candidate = (if (supplied.isAbsolute) supplied else File(root, raw)).canonicalFile
+    if (!isWithinWorkspace(root, candidate)) {
+        throw SecurityException("Caminho fora da área de trabalho do agente")
+    }
+    return candidate
 }
+
+/** Both arguments are canonical; separator-aware comparison avoids prefix tricks. */
+private fun isWithinWorkspace(root: File, candidate: File): Boolean =
+    candidate.path == root.path || candidate.path.startsWith(root.path + File.separator)
 
 /** Reads a text file, capped so a huge file cannot blow up the context window. */
 class ReadFileTool : Tool {
@@ -30,18 +38,22 @@ class ReadFileTool : Tool {
     """.trimIndent()
 
     override val parameters = Schema.obj(
-        "path" to Schema.string("Caminho do arquivo, relativo à área de trabalho ou absoluto."),
+        "path" to Schema.string("Caminho do arquivo dentro da área de trabalho do agente."),
         "offset" to Schema.integer("Número da primeira linha a ler (1-based). Padrão 1."),
         "limit" to Schema.integer("Quantidade máxima de linhas. Padrão $DEFAULT_LIMIT, máximo $MAX_LIMIT."),
         required = listOf("path"),
     )
+
+    override val risk = Risk.CAUTION
 
     override fun preview(args: JsonObject): String =
         "Ler o arquivo ${Args.string(args, "path").orEmpty()}"
 
     override suspend fun run(args: JsonObject, ctx: ToolContext): ToolResult = withContext(Dispatchers.IO) {
         val raw = Args.string(args, "path") ?: return@withContext ToolResult.error("Parâmetro 'path' é obrigatório.")
-        val file = resolvePath(ctx, raw)
+        val file = runCatching { resolvePath(ctx, raw) }.getOrElse {
+            return@withContext ToolResult.error("Caminho inválido ou fora da área de trabalho do agente.")
+        }
         if (!file.exists()) return@withContext ToolResult.error("Arquivo não encontrado: ${file.path}")
         if (file.isDirectory) return@withContext ToolResult.error("${file.path} é um diretório, não um arquivo.")
 
@@ -78,7 +90,7 @@ class WriteFileTool : Tool {
     """.trimIndent()
 
     override val parameters = Schema.obj(
-        "path" to Schema.string("Caminho do arquivo, relativo à área de trabalho ou absoluto."),
+        "path" to Schema.string("Caminho do arquivo dentro da área de trabalho do agente."),
         "content" to Schema.string("Conteúdo de texto a gravar."),
         "append" to Schema.boolean("Se true, adiciona ao final em vez de substituir. Padrão false."),
         required = listOf("path", "content"),
@@ -98,12 +110,17 @@ class WriteFileTool : Tool {
         val content = Args.string(args, "content")
             ?: return@withContext ToolResult.error("Parâmetro 'content' é obrigatório.")
         val append = Args.bool(args, "append") == true
-        val file = resolvePath(ctx, raw)
+        val file = runCatching { resolvePath(ctx, raw) }.getOrElse {
+            return@withContext ToolResult.error("Caminho inválido ou fora da área de trabalho do agente.")
+        }
 
         runCatching {
             file.parentFile?.mkdirs()
-            if (append) file.appendText(content) else file.writeText(content)
-            ToolResult.ok("${if (append) "Acrescentados" else "Gravados"} ${content.length} caracteres em ${file.path}")
+            // Re-resolve after creating parents so a newly introduced symlink
+            // cannot redirect the write beyond the checked workspace root.
+            val checked = resolvePath(ctx, raw)
+            if (append) checked.appendText(content) else checked.writeText(content)
+            ToolResult.ok("${if (append) "Acrescentados" else "Gravados"} ${content.length} caracteres em ${checked.path}")
         }.getOrElse { ToolResult.error("Falha ao escrever ${file.path}: ${it.message}") }
     }
 }
@@ -113,32 +130,49 @@ class ListDirTool : Tool {
 
     override val name = "list_dir"
 
+    /**
+     * SAFE deliberately, not by omission.
+     *
+     * [resolvePath] confines every path to the agent's own workspace, so this
+     * reads the sandbox that exists for the agent rather than the user's files —
+     * and it reports entries that link outside the workspace instead of
+     * following them. Approval here would fire constantly and train the user to
+     * dismiss the dialog. read_file and write_file stay CAUTION because they
+     * touch content.
+     */
+    override val risk = Risk.SAFE
+
     override val description = """
         Lista o conteúdo de um diretório com tipo e tamanho de cada entrada.
         Sem parâmetro, lista a área de trabalho do agente.
     """.trimIndent()
 
     override val parameters = Schema.obj(
-        "path" to Schema.string("Diretório a listar. Padrão: a área de trabalho do agente."),
+        "path" to Schema.string("Diretório dentro da área de trabalho. Padrão: a raiz da área de trabalho."),
     )
 
     override fun preview(args: JsonObject): String =
         "Listar o diretório ${Args.string(args, "path") ?: "de trabalho"}"
 
     override suspend fun run(args: JsonObject, ctx: ToolContext): ToolResult = withContext(Dispatchers.IO) {
-        val file = Args.string(args, "path")?.let { resolvePath(ctx, it) } ?: ctx.workspace
+        val file = runCatching { resolvePath(ctx, Args.string(args, "path") ?: ".") }.getOrElse {
+            return@withContext ToolResult.error("Caminho inválido ou fora da área de trabalho do agente.")
+        }
         if (!file.exists()) return@withContext ToolResult.error("Diretório não encontrado: ${file.path}")
         if (!file.isDirectory) return@withContext ToolResult.error("${file.path} não é um diretório.")
 
-        val entries = file.listFiles()?.sortedWith(
-            compareByDescending<File> { it.isDirectory }.thenBy { it.name.lowercase() },
-        ) ?: emptyList()
+        val entries = file.listFiles()?.sortedBy { it.name.lowercase() } ?: emptyList()
 
         val shown = entries.take(MAX_ENTRIES)
         val body = shown.joinToString("\n") { entry ->
-            val kind = if (entry.isDirectory) "dir " else "file"
-            val size = if (entry.isDirectory) "-" else humanSize(entry.length())
-            "$kind  $size  ${entry.name}"
+            val resolved = runCatching { entry.canonicalFile }.getOrNull()
+            if (resolved == null || !isWithinWorkspace(ctx.workspace.canonicalFile, resolved)) {
+                "link  -  ${entry.name} (destino fora da área de trabalho)"
+            } else {
+                val kind = if (resolved.isDirectory) "dir " else "file"
+                val size = if (resolved.isDirectory) "-" else humanSize(resolved.length())
+                "$kind  $size  ${entry.name}"
+            }
         }
         val more = if (entries.size > shown.size) "\n… e mais ${entries.size - shown.size} entradas." else ""
         ToolResult.ok("${file.path} (${entries.size} entradas)\n$body$more")

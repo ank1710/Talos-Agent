@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * Where the model that answers a conversation actually runs.
@@ -92,7 +93,12 @@ data class TalosSettings(
      * exist for this mode.
      */
     val isConfigured: Boolean
-        get() = mode == ModelMode.ON_DEVICE || effectiveApiKey.isNotBlank()
+        get() = when {
+            mode == ModelMode.ON_DEVICE -> true
+            usingDesktopBridge -> effectiveApiKey.isNotBlank()
+            provider.id == ProviderCatalog.CUSTOM.id && isLoopbackOrPrivateEndpoint(baseUrl) -> true
+            else -> effectiveApiKey.isNotBlank()
+        }
 
     companion object {
         const val DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
@@ -128,6 +134,34 @@ data class TalosSettings(
         fun fromStored(value: String?): ModelMode? =
             ModelMode.entries.firstOrNull { it.name.equals(value, ignoreCase = true) }
     }
+}
+
+/**
+ * A missing key is acceptable only for a custom endpoint whose host is an
+ * explicitly local/private IP. Public custom hosts still require credentials.
+ */
+private fun isLoopbackOrPrivateEndpoint(baseUrl: String): Boolean {
+    val host = baseUrl.toHttpUrlOrNull()?.host?.lowercase() ?: return false
+    if (host == "localhost" || host.endsWith(".localhost")) return true
+
+    val octets = host.split('.')
+    if (octets.size == 4 && octets.all { it.isNotEmpty() && it.all { digit -> digit in '0'..'9' } }) {
+        val bytes = octets.map { it.toIntOrNull()?.takeIf { value -> value in 0..255 } ?: return false }
+        val (first, second) = bytes
+        return first == 127 || first == 10 ||
+            (first == 172 && second in 16..31) ||
+            (first == 192 && second == 168)
+    }
+
+    // A colon ensures this is an IPv6 literal, so parsing cannot perform DNS.
+    if (':' in host) {
+        val literal = host.removePrefix("[").removeSuffix("]")
+        val address = runCatching { java.net.InetAddress.getByName(literal) }.getOrNull() ?: return false
+        if (address.isLoopbackAddress) return true
+        val bytes = address.address
+        return bytes.size == 16 && (bytes[0].toInt() and 0xfe) == 0xfc // fc00::/7 ULA
+    }
+    return false
 }
 
 

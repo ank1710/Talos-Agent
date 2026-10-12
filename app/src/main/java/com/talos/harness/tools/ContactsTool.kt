@@ -36,7 +36,7 @@ class ContactsSearchTool : Tool {
         required = listOf("query"),
     )
 
-    override val risk = Risk.SAFE
+    override val risk = Risk.CAUTION
 
     override fun preview(args: JsonObject): String =
         "Procurar contato por \"${Args.string(args, "query").orEmpty()}\""

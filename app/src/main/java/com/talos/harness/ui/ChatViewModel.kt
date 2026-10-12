@@ -20,6 +20,7 @@ import com.talos.harness.agent.newId
 import com.talos.harness.gateway.GatewayApprovalClient
 import com.talos.harness.gateway.GatewayApprovalGate
 import com.talos.harness.gateway.decisionForGatewayChoice
+import com.talos.harness.gateway.gatewayOrigin
 import com.talos.harness.gateway.gatewayChoiceFor
 import com.talos.harness.llm.ChatBackend
 import com.talos.harness.llm.DeepSeekClient
@@ -73,6 +74,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.coroutines.cancellation.CancellationException
@@ -345,6 +347,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var benchmarkJob: Job? = null
     private var approvalDeferred: CompletableDeferred<ApprovalDecision>? = null
 
+    private data class ActiveGatewayRun(
+        val runId: String,
+        val target: GatewayApprovalGate.Target,
+    )
+
+    // The stream callback runs on IO while Stop runs on Main; volatile snapshots
+    // let Stop capture the exact remote run before cancelling its local parent.
+    @Volatile private var activeRunToken: Any? = null
+    @Volatile private var activeGatewayRun: ActiveGatewayRun? = null
+
     /** Mirrors the persisted allowlist so the gate can answer without I/O. */
     private var autoApproved: Set<String> = emptySet()
 
@@ -390,11 +402,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     init {
-        // Gateway control frames carry no chat chunk and AgentLoop must not be
-        // touched to forward them, so the client this view model owns hands them
-        // over directly.
-        client.onGatewayEvent = ::onGatewayFrame
-
         viewModelScope.launch {
             settingsRepo.flow.collect { settings ->
                 autoApproved = settings.autoApprovedTools
@@ -450,7 +457,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
         val settings = _state.value.settings
         if (!settings.isConfigured) {
-            _state.update { it.copy(error = "Configure sua chave da API DeepSeek em Ajustes.") }
+            _state.update {
+                it.copy(error = "Configure a chave de API de ${settings.provider.displayName} em Ajustes.")
+            }
             return
         }
 
@@ -479,6 +488,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Cancels the in-flight turn; whatever streamed so far stays in the transcript. */
     fun stop() {
+        val remoteRun = activeGatewayRun
+        activeRunToken = null
+        activeGatewayRun = null
         runJob?.cancel()
         runJob = null
         approvalDeferred?.cancel()
@@ -487,6 +499,25 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         gatewayGate.cancel()
         _state.update { it.copy(isRunning = false, pendingApproval = null) }
         persist(_state.value.conversation)
+
+        // This request is intentionally outside the cancelled run's job: it is
+        // the remote half of Stop and must survive cancellation of the local stream.
+        if (remoteRun != null) {
+            viewModelScope.launch {
+                gatewayClient.stopRun(
+                    baseUrl = remoteRun.target.baseUrl,
+                    apiKey = remoteRun.target.apiKey,
+                    runId = remoteRun.runId,
+                ).onFailure { error ->
+                    _state.update {
+                        it.copy(
+                            statusMessage = error.message ?: "Não consegui confirmar o cancelamento no PC.",
+                            statusIsError = true,
+                        )
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -510,7 +541,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // clearing `pendingApproval` now would wipe that one off the screen
             // and leave it parked with nothing to answer. onSettled clears the
             // entry that was actually answered.
-            viewModelScope.launch { postDecision(answered.runId, answered.requestId, choice) }
+            val lifecycle = runJob
+            if (answered.target == null || answered.runId.isBlank() || lifecycle == null || !lifecycle.isActive) {
+                _state.update {
+                    it.copy(
+                        statusMessage = "A execução do PC terminou; a resposta não foi enviada.",
+                        statusIsError = true,
+                    )
+                }
+                return
+            }
+            // As a child of the stream job, this POST cannot outlive Stop. The
+            // client also cancels the underlying OkHttp call when this job ends.
+            viewModelScope.launch(lifecycle) { postDecision(answered, choice) }
             return
         }
 
@@ -535,7 +578,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * the id, so a prompt that registers after that frame fails closed instead of
      * stranding.
      */
-    private fun onGatewayFrame(event: StreamEvent) {
+    private fun onGatewayFrame(
+        event: StreamEvent,
+        target: GatewayApprovalGate.Target?,
+        runToken: Any,
+    ) {
+        if (activeRunToken !== runToken) return
         when (event) {
             is StreamEvent.GatewayApprovalRequested -> {
                 // Only the advertised decisions become buttons; an unknown choice
@@ -543,25 +591,48 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val offered = event.choices
                     .mapNotNull(::decisionForGatewayChoice)
                     .distinct()
-                    .ifEmpty { listOf(ApprovalDecision.APPROVE_ONCE, ApprovalDecision.REJECT) }
+
+                val runId = event.runId.takeIf { it.isNotBlank() }
+                if (runId != null) recordGatewayRun(runId, target, runToken)
+
+                // A generic command or a guessed Allow button hides missing
+                // gateway metadata. Stop this run instead of asking for consent
+                // that cannot be bound to one advertised operation.
+                if (
+                    runId == null || event.requestId.isNullOrBlank() || event.command.isBlank() ||
+                    offered.isEmpty() || target == null
+                ) {
+                    viewModelScope.launch {
+                        if (activeRunToken !== runToken) return@launch
+                        _state.update {
+                            it.copy(
+                                error = "Pedido de aprovação do PC inválido (comando, identificadores ou opções ausentes). Execução interrompida por segurança.",
+                            )
+                        }
+                        stop()
+                    }
+                    return
+                }
 
                 // Captured on the frame callback, before any coroutine runs: the
                 // ids and the prompt become one value, so a second
                 // `approval.request` read before this launch is dispatched cannot
                 // re-point the answer to this one.
-                val frame = gatewayGate.forFrame(event.runId, event.requestId, event.choices)
+                val frame = gatewayGate.forFrame(runId, event.requestId, event.choices, target)
                 val request = ApprovalRequest(
-                    id = event.requestId ?: newId(),
+                    id = event.requestId,
                     toolName = "ação no computador",
                     arguments = event.command,
-                    preview = event.command.ifBlank { "O PC pediu permissão para continuar." },
+                    preview = event.command,
                     // The desktop's policy decided to ask; we cannot know
                     // how risky it is, and the safe default is "look".
                     risk = Risk.CAUTION,
                     choices = offered,
                 )
 
-                viewModelScope.launch { gatewayGate.request(request, frame) }
+                val lifecycle = runJob
+                if (lifecycle == null || !lifecycle.isActive || activeRunToken !== runToken) return
+                viewModelScope.launch(lifecycle) { gatewayGate.request(request, frame) }
             }
 
             is StreamEvent.GatewayApprovalResolved -> {
@@ -590,11 +661,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * A 409 (`approval_not_pending`) is a soft outcome: the prompt was already
      * answered or expired, which needs no error banner — just a note.
      */
-    private suspend fun postDecision(runId: String, requestId: String?, choice: String) {
+    private suspend fun postDecision(answered: GatewayApprovalGate.Parked, choice: String) {
         val settings = _state.value.settings
+        val target = answered.target ?: return
         // The run lives on the gateway; if the user switched back to DeepSeek
-        // while the dialog was open, there is no endpoint left to answer — and
-        // posting the chat key at api.deepseek.com would be nonsense.
+        // while the dialog was open, refuse to send the old run's credential.
         if (!settings.usingDesktopBridge) {
             _state.update {
                 it.copy(
@@ -604,13 +675,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
             return
         }
+
+        // Use the captured base URL and key for the request. A changed origin
+        // must never receive a bearer key from the gateway that raised the prompt.
+        if (gatewayOrigin(settings.baseUrl) != target.origin) {
+            _state.update {
+                it.copy(
+                    statusMessage = "A origem do gateway mudou; a resposta não foi enviada.",
+                    statusIsError = true,
+                )
+            }
+            return
+        }
+        if (settings.effectiveApiKey != target.apiKey) {
+            _state.update {
+                it.copy(
+                    statusMessage = "A chave do gateway mudou; a resposta não foi enviada.",
+                    statusIsError = true,
+                )
+            }
+            return
+        }
         gatewayClient
             .respond(
-                baseUrl = settings.baseUrl,
-                apiKey = settings.effectiveApiKey,
-                runId = runId,
+                baseUrl = target.baseUrl,
+                apiKey = target.apiKey,
+                runId = answered.runId.orEmpty(),
                 choice = choice,
-                requestId = requestId,
+                requestId = answered.requestId,
             )
             .onSuccess {
                 _state.update { it.copy(statusMessage = "Resposta enviada ao PC.", statusIsError = false) }
@@ -751,7 +843,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val settings = _state.value.settings
         val history = _state.value.conversation.messages
         val local = settings.mode == ModelMode.ON_DEVICE
+        val targetSnapshot = gatewayTarget(settings)
+        val runToken = Any()
 
+        activeRunToken = runToken
+        activeGatewayRun = null
         runJob?.cancel()
         _state.update { it.copy(isRunning = true) }
 
@@ -759,6 +855,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // CLOUD and DESKTOP bind the selected provider's auth to this turn;
             // only ON_DEVICE swaps out the remote client entirely.
             val turnBackend = if (local) onDeviceEngine else client.forProvider(settings.provider)
+            if (turnBackend is DeepSeekClient) {
+                // Bind gateway callbacks to this turn's endpoint and lifecycle;
+                // stale callbacks from a cancelled stream cannot retarget Stop.
+                turnBackend.onGatewayEvent = { event -> onGatewayFrame(event, targetSnapshot, runToken) }
+                turnBackend.onGatewayRunId = { id -> recordGatewayRun(id, targetSnapshot, runToken) }
+            }
             val loop = AgentLoop(
                 client = turnBackend,
                 // Rebuilt per turn, so the subagent spawner in it captures the
@@ -798,10 +900,33 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             } catch (e: Throwable) {
                 _state.update { it.copy(error = e.message ?: "Erro inesperado ao falar com o modelo.") }
             } finally {
-                _state.update { it.copy(isRunning = false) }
-                persist(_state.value.conversation)
+                if (activeRunToken === runToken) {
+                    activeGatewayRun = null
+                    activeRunToken = null
+                    _state.update { it.copy(isRunning = false) }
+                    persist(_state.value.conversation)
+                }
             }
         }
+    }
+
+    private fun gatewayTarget(settings: TalosSettings): GatewayApprovalGate.Target? {
+        if (!settings.usingDesktopBridge) return null
+        val origin = gatewayOrigin(settings.baseUrl) ?: return null
+        return GatewayApprovalGate.Target(
+            baseUrl = settings.baseUrl,
+            origin = origin,
+            apiKey = settings.effectiveApiKey,
+        )
+    }
+
+    private fun recordGatewayRun(
+        runId: String,
+        target: GatewayApprovalGate.Target?,
+        runToken: Any,
+    ) {
+        if (runId.isBlank() || target == null || activeRunToken !== runToken) return
+        activeGatewayRun = ActiveGatewayRun(runId, target)
     }
 
     /**
@@ -966,7 +1091,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateApiKey(value: String) = viewModelScope.launch { settingsRepo.setApiKey(value) }
 
-    fun updateBaseUrl(value: String) = viewModelScope.launch { settingsRepo.setBaseUrl(value) }
+    fun updateBaseUrl(value: String) {
+        // Update the value checked by a pending gateway approval before the
+        // asynchronous DataStore write can make that origin change visible.
+        _state.update { it.copy(settings = it.settings.copy(baseUrl = value)) }
+        viewModelScope.launch { settingsRepo.setBaseUrl(value) }
+    }
 
     /** Saves one provider, switches to its known URL, then refreshes its model list. */
     fun selectProvider(providerId: String) {
@@ -1205,7 +1335,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         benchmarkJob = null
     }
 
-    fun updateGatewayApiKey(value: String) = viewModelScope.launch { settingsRepo.setGatewayApiKey(value) }
+    fun updateGatewayApiKey(value: String) {
+        _state.update { it.copy(settings = it.settings.copy(gatewayApiKey = value)) }
+        viewModelScope.launch { settingsRepo.setGatewayApiKey(value) }
+    }
 
     fun revokeApproval(toolName: String) = viewModelScope.launch { settingsRepo.revokeApproval(toolName) }
 
@@ -1220,7 +1353,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _state.update {
             it.copy(isBusy = true, availableModels = emptyList(), statusMessage = null, statusIsError = false)
         }
-        if (settings.provider.requiresApiKeyForModels && settings.effectiveApiKey.isBlank()) {
+        val customRemoteMissingKey = settings.provider.id == ProviderCatalog.CUSTOM.id && !settings.isConfigured
+        if (
+            settings.effectiveApiKey.isBlank() &&
+            (settings.provider.requiresApiKeyForModels || customRemoteMissingKey)
+        ) {
             _state.update {
                 it.copy(
                     isBusy = false,
@@ -1254,7 +1391,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun testConnection() {
         val settings = _state.value.settings
         viewModelScope.launch {
-            if (settings.provider.requiresApiKeyForModels && settings.effectiveApiKey.isBlank()) {
+            val customRemoteMissingKey = settings.provider.id == ProviderCatalog.CUSTOM.id && !settings.isConfigured
+            if (
+                settings.effectiveApiKey.isBlank() &&
+                (settings.provider.requiresApiKeyForModels || customRemoteMissingKey)
+            ) {
                 _state.update {
                     it.copy(
                         isBusy = false,

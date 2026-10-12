@@ -44,6 +44,18 @@ class GatewayApprovalGate(
 ) : ApprovalGate {
 
     /**
+     * The endpoint and key captured when one desktop run started.
+     * Its custom string form avoids leaking the credential through accidental logs.
+     */
+    class Target(
+        val baseUrl: String,
+        val origin: String,
+        val apiKey: String,
+    ) {
+        override fun toString(): String = "GatewayApprovalTarget(origin=$origin)"
+    }
+
+    /**
      * One parked prompt together with the ids read off the frame that raised it.
      *
      * The ids are kept per entry, not in gate-wide fields: with several prompts
@@ -56,6 +68,7 @@ class GatewayApprovalGate(
         val runId: String?,
         val requestId: String?,
         val choices: List<String>,
+        val target: Target?,
     )
 
     /**
@@ -74,6 +87,7 @@ class GatewayApprovalGate(
         internal val runId: String?,
         internal val requestId: String?,
         internal val choices: List<String>,
+        internal val target: Target?,
         internal val cancelEpoch: Int,
     )
 
@@ -124,8 +138,12 @@ class GatewayApprovalGate(
      * Call it on the frame callback, not inside the coroutine that parks the
      * prompt: the point is to bind the ids to the prompt as the frame is read.
      */
-    fun forFrame(runId: String?, requestId: String?, choices: List<String> = emptyList()): Frame =
-        Frame(runId, requestId, choices, cancelEpoch)
+    fun forFrame(
+        runId: String?,
+        requestId: String?,
+        choices: List<String> = emptyList(),
+        target: Target? = null,
+    ): Frame = Frame(runId, requestId, choices, target, cancelEpoch)
 
     /** The oldest prompt still waiting, with the ids needed to answer it. */
     val oldest: Parked?
@@ -161,7 +179,7 @@ class GatewayApprovalGate(
      * published, instead of parking and stranding the caller.
      */
     suspend fun request(request: ApprovalRequest, frame: Frame): ApprovalDecision {
-        val snapshot = Parked(request, frame.runId, frame.requestId, frame.choices)
+        val snapshot = Parked(request, frame.runId, frame.requestId, frame.choices, frame.target)
         val slot = synchronized(lock) {
             val alreadySettled = frame.cancelEpoch < cancelEpoch ||
                 (frame.requestId != null && frame.requestId in settledEarly)

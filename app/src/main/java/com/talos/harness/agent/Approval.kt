@@ -32,5 +32,11 @@ enum class ApprovalDecision {
  * remote approval from the desktop. The loop stays unaware of the channel.
  */
 interface ApprovalGate {
+    /**
+     * Whether this gate needs to decide this call. Unattended gates override
+     * this to inspect every tool name; interactive gates keep the SAFE fast path.
+     */
+    fun requiresApproval(request: ApprovalRequest): Boolean = request.risk != Risk.SAFE
+
     suspend fun request(request: ApprovalRequest): ApprovalDecision
 }

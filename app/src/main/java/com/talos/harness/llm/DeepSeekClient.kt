@@ -49,6 +49,9 @@ class DeepSeekClient(
      */
     var onGatewayEvent: ((StreamEvent) -> Unit)? = null
 
+    /** Run id observed on the current stream, before an approval prompt may arrive. */
+    var onGatewayRunId: ((String) -> Unit)? = null
+
     override fun streamChat(
         apiKey: String,
         baseUrl: String,
@@ -108,7 +111,10 @@ class DeepSeekClient(
                         TalosJson.decodeFromString(StreamChunk.serializer(), data)
                     }.getOrNull() ?: continue
 
-                    chunk.id?.let { runId = it }
+                    chunk.id?.let {
+                        runId = it
+                        onGatewayRunId?.invoke(it)
+                    }
                     chunk.usage?.let { emit(StreamEvent.Usage(it)) }
 
                     for (choice in chunk.choices) {
@@ -179,6 +185,7 @@ class DeepSeekClient(
     /** Reuses the HTTP pool while binding authentication to one provider per turn. */
     fun forProvider(value: Provider): DeepSeekClient = DeepSeekClient(http, value).also {
         it.onGatewayEvent = onGatewayEvent
+        it.onGatewayRunId = onGatewayRunId
     }
 
     /** Best-effort model discovery so settings can show provider names and ids. */
@@ -236,12 +243,15 @@ class DeepSeekClient(
         val hint = when (code) {
             400 -> "Requisição inválida."
             401 -> "Chave de API inválida ou ausente."
-            402 -> "Saldo insuficiente na conta DeepSeek."
+            402 -> "Saldo insuficiente na conta do provedor."
             403 -> "Acesso negado para esta chave."
             404 -> "Endpoint não encontrado — confira a URL base."
             422 -> "Parâmetros rejeitados pelo modelo."
             429 -> "Limite de requisições atingido. Tente de novo em instantes."
-            in 500..599 -> "Erro no servidor da DeepSeek. Tente novamente."
+            // Provider-neutral on purpose: this client serves every configured
+            // provider, and naming one of them told the user "DeepSeek" while
+            // they were talking to Ollama on their own machine.
+            in 500..599 -> "Erro no servidor do provedor. Tente novamente."
             else -> "Falha HTTP $code."
         }
         return if (apiMessage.isNullOrBlank()) hint else "$hint ($apiMessage)"
