@@ -343,6 +343,7 @@ class SpawnSubagentTool(
             appendLine("- Se não conseguiu concluir, diga exatamente o que faltou e qual foi o erro. Não invente resultado.")
             appendLine()
             appendLine("# Limites")
+            appendLine(com.talos.harness.agent.SystemPrompt.UNTRUSTED_POLICY)
             appendLine("- Comandos de shell e escritas em disco passam por confirmação do usuário; se ele recusar, não insista: siga por outro caminho ou relate o bloqueio.")
         }
 

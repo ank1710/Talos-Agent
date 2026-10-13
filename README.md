@@ -19,13 +19,22 @@ key change.
 | Tools: `shell`, `read_file`, `write_file`, `list_dir` | working |
 | Tools: `device_info`, `notify`, `clipboard_read/write`, `open_url`, `list_apps` | working, verified on device |
 | Chat UI (streaming markdown, reasoning disclosure, tool cards) | working, verified on device |
-| Settings (key, base URL, model, temperature, diagnostics) | working |
+| Settings (scoped connections, local/cloud modes, memory policy, model benchmark) | implemented; debug build + 22 host checks; screenshot wrap verified on device; Qwen3 benchmarked on S24 Ultra |
+| Local model catalog | live Hugging Face search + confirmation dialog verified on S24 Ultra; parser and size/SHA-256 integrity checks pass host tests |
 | Conversations on disk (list, open, delete) | working |
+| Persistent memory, history search and reusable skills | implemented; debug build and host checks passed; device validation pending |
 | Share target (text + image) and text-selection menu | working, verified via `am start` |
 | Vision (gallery, camera, thumbnails, multimodal wire) | working, verified on device |
 | Voice input (STT) and spoken replies (TTS) | working, verified on device |
 | Scheduled / unattended runs | in progress |
 | Desktop bridge | running as an isolated gateway; UI selector not built |
+
+The local model catalog only lists bundles for Talos's LiteRT-LM runtime. File
+size is compared with the phone's measured RAM budget as an estimate; it does
+not guarantee that a particular bundle initializes on every device. Downloads
+need an explicit confirmation, at least 500 MiB of storage reserve, and a Hub
+SHA-256; verified files keep the `.litertlm` extension and are not selected
+automatically. See [the catalog notes](docs/local-model-catalog.md).
 
 ### Verified on the device, not just compiled
 
@@ -122,7 +131,8 @@ tools/         Tool interface, registry, shell/file tools, device tools
 media/         MediaResolver — content URI to downscaled base64 data URL, with an LRU
 voice/         VoiceController — SpeechRecognizer + TextToSpeech, main-thread marshalled
 schedule/      ScheduledTask, ScheduledTaskStore, ScheduledAgentWorker, ScheduleScheduler
-store/         SettingsRepository (DataStore), ConversationStore (JSON files)
+store/         SettingsRepository (DataStore), ConversationStore (JSON files),
+               MemoryStore / SkillStore (editable text files)
 notifications/ TalosNotifications — the single channel everything posts to
 ui/theme/      TalosPalette + TalosTheme
 ui/markdown/   pure, total markdown parser + Compose renderer
@@ -192,9 +202,11 @@ Ordered by how much they matter.
 - **The API keys are stored in app-private DataStore, not behind the Keystore.**
   Fine for a private build; harden before distributing.
 - **`release` builds are unsigned and unminified.**
-- **No automated tests.** The markdown parser was fuzz-validated out of band and
-  the protocol shapes were checked against the live API, but the agent loop,
-  tools and scheduler have only been exercised by hand.
+- **Host checks cover persistent data and its approval boundaries.** After a debug
+  build, run `python3 scripts/check-persistent-data.py` (uses the pinned Kotlin
+  artifacts already in the local Gradle cache, without invoking Gradle). The host
+  checks use Android stand-ins and a scripted model; they do not validate Compose,
+  LiteRT, provider behaviour or WorkManager on the phone.
 - **`local.properties` is machine-specific and gitignored.**
 
 ## Verifying on a device
@@ -207,3 +219,28 @@ before trusting it, and prefer reading state the app wrote to disk
 (`files/schedule/tasks.json`, `files/datastore/talos_settings.preferences_pb`)
 over inferring it from a screenshot.
 
+
+## Memory, history search and skills
+
+Ajustes → **Memória** and **Skills** let the user inspect, create, edit and delete
+persistent records. Skills can also be requested from the chat through **Executar**;
+loading their steps does not approve subsequent actions. Records are editable UTF-8
+files under app-private `files/memory/*.md` and `files/skills/*.md`, outside the agent
+workspace. The skill filename is its name; headers record creation, last edit and
+origin, followed by a blank line and the text. Keep the header format when editing
+files externally, then press **Atualizar**. Regular user editing needs only the UI.
+
+The full interactive catalogue includes `memory` (`save`, `forget`, `list`),
+`session_search` (literal search, optional date range, paginated excerpts) and
+`skill` (`create`, `list`, `execute`, `edit`, `delete`). All three are CAUTION and
+excluded from scheduled runs. A model with a declared window below 4096 retains
+the existing three tools: it receives bounded memory/skill summaries, but these
+new tools require a larger local model or a remote provider. Settings editing is
+available offline regardless of the model.
+
+See [the implementation and security report](docs/memory-skills-report.md) for
+file-by-file changes, context budgets, test evidence and the remaining limitation:
+an opted-in scheduled `shell` still has the app's filesystem authority.
+
+See [the Settings and local-model follow-up](docs/settings-followup-and-local-model.md)
+for connection safety, validation status and the tested-device model shortlist.

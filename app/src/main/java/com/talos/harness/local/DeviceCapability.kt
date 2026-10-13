@@ -263,7 +263,7 @@ object DeviceCapability {
  * Used both here and by [ModelFile.sizeLabel] so a size never appears in two
  * different formats.
  */
-internal fun formatBytes(value: Long): String {
+fun formatBytes(value: Long): String {
     val locale = Locale.forLanguageTag("pt-BR")
     return when {
         value >= 1024L * MB -> java.lang.String.format(locale, "%.1f GB", value.toDouble() / (1024L * MB))

@@ -37,6 +37,12 @@ class DeepSeekClient(
     private val provider: Provider = ProviderCatalog.DEEPSEEK,
 ) : ChatBackend {
 
+    // Settings checks must finish promptly and must not forward a scoped key through a redirect.
+    private val discoveryHttp by lazy {
+        http.newBuilder().callTimeout(15, TimeUnit.SECONDS).readTimeout(15, TimeUnit.SECONDS)
+            .followRedirects(false).followSslRedirects(false).build()
+    }
+
     /**
      * Sink for the gateway's own control frames (see [StreamEvent.GatewayApprovalRequested]).
      *
@@ -200,7 +206,7 @@ class DeepSeekClient(
             .get()
             .build()
         runCatching {
-            http.newCall(request).execute().use { response ->
+            discoveryHttp.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return@use emptyList()
                 val text = response.body.string()
                 val data = (TalosJson.parseToJsonElement(text) as? JsonObject)?.get("data") as? JsonArray
@@ -226,7 +232,7 @@ class DeepSeekClient(
             .get()
             .build()
         try {
-            http.newCall(request).execute().use { response ->
+            discoveryHttp.newCall(request).execute().use { response ->
                 if (response.isSuccessful) null
                 else describeHttpError(response.code, response.body.string())
             }

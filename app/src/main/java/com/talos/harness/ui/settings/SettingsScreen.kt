@@ -1,6 +1,8 @@
 package com.talos.harness.ui.settings
 
 import androidx.activity.compose.BackHandler
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -23,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -42,6 +45,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,19 +60,25 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.talos.harness.local.BenchmarkOutcome
 import com.talos.harness.local.BenchmarkResult
+import com.talos.harness.local.HuggingFaceModelBundle
 import com.talos.harness.local.ModelFile
 import com.talos.harness.local.ModelRecommendation
 import com.talos.harness.local.formatBytes
 import com.talos.harness.local.formatDuration
 import com.talos.harness.local.formatTokensPerSecond
+import com.talos.harness.store.ConnectionDraft
+import com.talos.harness.store.MemoryEntry
+import com.talos.harness.store.SkillEntry
 import com.talos.harness.store.ModelMode
 import com.talos.harness.store.ProviderCatalog
 import com.talos.harness.store.ProviderModel
 import com.talos.harness.store.TalosSettings
+import com.talos.harness.ui.LocalModelDownloadStatus
 import com.talos.harness.ui.theme.TalosColors
 import java.util.Locale
 
@@ -83,9 +93,12 @@ import java.util.Locale
 private enum class SettingsSection(val title: String) {
     ROOT("Ajustes"),
     RUNTIME("Onde roda o modelo"),
+    LOCAL_MODELS("Modelos locais"),
     CONNECTION("Provedor e conexão"),
     MODEL("Modelo"),
     APPROVALS("Aprovações"),
+    MEMORY("Memória"),
+    SKILLS("Skills"),
     DIAGNOSTICS("Diagnóstico"),
 }
 
@@ -140,12 +153,15 @@ fun SettingsScreen(
     benchmarkResults: Map<String, BenchmarkResult>,
     benchmarkingModel: String?,
     benchmarkStage: String?,
-    onApiKeyChange: (String) -> Unit,
-    onProviderChange: (String) -> Unit,
-    onBaseUrlChange: (String) -> Unit,
-    onUseLocalGateway: () -> Unit,
-    onGatewayApiKeyChange: (String) -> Unit,
-    onModelChange: (String) -> Unit,
+    localModelBundles: List<HuggingFaceModelBundle>,
+    localModelSearchQuery: String?,
+    localModelSearchBusy: Boolean,
+    localModelSearchError: String?,
+    localModelDownload: LocalModelDownloadStatus?,
+    onSaveConnection: suspend (ConnectionDraft) -> Result<Unit>,
+    onTestDraft: suspend (ConnectionDraft) -> Result<Unit>,
+    onFetchDraftModels: suspend (ConnectionDraft) -> Result<List<ProviderModel>>,
+    isRunning: Boolean,
     onTemperatureChange: (Double) -> Unit,
     onUseCloud: () -> Unit,
     onUsePc: () -> Unit,
@@ -154,11 +170,30 @@ fun SettingsScreen(
     onSelectOnDeviceModel: (String) -> Unit,
     onBenchmarkModel: (String) -> Unit,
     onCancelBenchmark: () -> Unit,
+    onSearchLocalModels: (String) -> Unit,
+    onInstallLocalModel: (HuggingFaceModelBundle) -> Unit,
+    onCancelLocalModelDownload: () -> Unit,
     onFetchModels: () -> Unit,
     onTestConnection: () -> Unit,
     onRevokeApproval: (String) -> Unit,
     onClearApprovals: () -> Unit,
     onBack: () -> Unit,
+    memories: List<MemoryEntry>,
+    skills: List<SkillEntry>,
+    memoryDirectory: String,
+    skillsDirectory: String,
+    persistenceBusy: Boolean,
+    memoryError: String?,
+    skillsError: String?,
+    skillExecutionUnavailable: String?,
+    conversationTitles: Map<String, String>,
+    onMemoryPolicy: suspend (Boolean, Boolean) -> Result<Unit>,
+    onRefreshPersistentData: () -> Unit,
+    onSaveMemory: suspend (String?, String) -> Result<Unit>,
+    onDeleteMemory: suspend (String) -> Result<Unit>,
+    onSaveSkill: suspend (String, String, String, String, Boolean) -> Result<Unit>,
+    onDeleteSkill: suspend (String) -> Result<Unit>,
+    onExecuteSkill: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val palette = TalosColors.current
@@ -171,9 +206,21 @@ fun SettingsScreen(
         ?: SettingsSection.ROOT
     // The system back gesture must walk sub-menu -> root before it leaves Settings;
     // without this the user would jump straight out of a section into the chat.
+    var connectionDirty by remember { mutableStateOf(false) }
+    var connectionSaving by remember { mutableStateOf(false) }
+    var discardConnection by remember { mutableStateOf(false) }
     val goBack: () -> Unit = {
-        if (section == SettingsSection.ROOT) onBack() else sectionName = SettingsSection.ROOT.name
+        if (!connectionSaving) {
+            if (section == SettingsSection.CONNECTION && connectionDirty) discardConnection = true
+            else if (section == SettingsSection.ROOT) onBack() else sectionName = SettingsSection.ROOT.name
+        }
     }
+    if (discardConnection) AlertDialog(onDismissRequest = { discardConnection = false },
+        title = { Text("Descartar alterações da conexão?") }, text = { Text("A configuração ativa ainda não foi alterada.") },
+        confirmButton = { TextButton(onClick = {
+            discardConnection = false; connectionDirty = false; sectionName = SettingsSection.ROOT.name
+        }) { Text("Descartar") } },
+        dismissButton = { TextButton(onClick = { discardConnection = false }) { Text("Continuar editando") } })
     BackHandler(enabled = true) { goBack() }
 
     Scaffold(
@@ -201,7 +248,7 @@ fun SettingsScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(contentPadding)
-                .verticalScroll(rememberScrollState())
+                .then(if (section == SettingsSection.MEMORY || section == SettingsSection.SKILLS) Modifier else Modifier.verticalScroll(rememberScrollState()))
                 .padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
             when (section) {
@@ -211,6 +258,8 @@ fun SettingsScreen(
                     statusMessage = statusMessage,
                     deviceRecommendation = deviceRecommendation,
                     installedModels = installedModels,
+                    memoryCount = memories.size,
+                    skillCount = skills.size,
                     onOpen = { sectionName = it.name },
                 )
 
@@ -230,31 +279,62 @@ fun SettingsScreen(
                     onSelectModel = onSelectOnDeviceModel,
                     onBenchmarkModel = onBenchmarkModel,
                     onCancelBenchmark = onCancelBenchmark,
+                    allowModeChange = !isRunning && benchmarkingModel == null,
                 )
 
-                SettingsSection.CONNECTION -> ConnectionSection(
-                    settings = settings,
-                    onApiKeyChange = onApiKeyChange,
-                    onProviderChange = onProviderChange,
-                    onBaseUrlChange = onBaseUrlChange,
-                    onUseLocalGateway = onUseLocalGateway,
-                    onGatewayApiKeyChange = onGatewayApiKeyChange,
+                SettingsSection.LOCAL_MODELS -> LocalModelCatalogSection(
+                    bundles = localModelBundles,
+                    searchedQuery = localModelSearchQuery,
+                    busy = localModelSearchBusy,
+                    error = localModelSearchError,
+                    recommendation = deviceRecommendation,
+                    installedModels = installedModels,
+                    download = localModelDownload,
+                    onSearch = onSearchLocalModels,
+                    onInstall = onInstallLocalModel,
+                    onCancelDownload = onCancelLocalModelDownload,
+                    onSelectModel = onSelectOnDeviceModel,
+                )
+
+                SettingsSection.CONNECTION -> if (settings.mode == ModelMode.ON_DEVICE) {
+                    Text("O modelo local não precisa de endereço ou chave. Configure o modelo em Onde roda o modelo.")
+                } else ConnectionSection(
+                    settings = settings, running = isRunning,
+                    onDirtyChange = { connectionDirty = it }, onSavingChange = { connectionSaving = it },
+                    onSave = onSaveConnection, onTest = onTestDraft, onFetchModels = onFetchDraftModels,
                 )
 
                 SettingsSection.MODEL -> ModelSection(
                     settings = settings,
-                    availableModels = availableModels,
-                    onModelChange = onModelChange,
+                    onEditModel = { sectionName = if (settings.mode == ModelMode.ON_DEVICE) SettingsSection.RUNTIME.name else SettingsSection.CONNECTION.name },
                     onTemperatureChange = onTemperatureChange,
                 )
 
+                SettingsSection.MEMORY -> MemorySection(
+                    memories, memoryDirectory, persistenceBusy, memoryError, settings, conversationTitles,
+                    onRefreshPersistentData, onMemoryPolicy, onSaveMemory, onDeleteMemory,
+                )
+                SettingsSection.SKILLS -> SkillsSection(
+                    skills, skillsDirectory, persistenceBusy, skillExecutionUnavailable, skillsError,
+                    conversationTitles, onRefreshPersistentData, onSaveSkill, onDeleteSkill, onExecuteSkill,
+                )
                 SettingsSection.APPROVALS -> ApprovalsSection(
                     settings = settings,
                     onRevokeApproval = onRevokeApproval,
                     onClearApprovals = onClearApprovals,
                 )
 
-                SettingsSection.DIAGNOSTICS -> DiagnosticsSection(
+                SettingsSection.DIAGNOSTICS -> if (settings.mode == ModelMode.ON_DEVICE) {
+                    Text("Diagnóstico local", style = MaterialTheme.typography.titleMedium)
+                    Text("${installedModels.size} modelos instalados. A verificação roda no aparelho, sem acesso à rede.")
+                    Text("Selecionado: $selectedOnDeviceModel")
+                    OutlinedButton(onClick = onRefreshModels) { Text("Atualizar modelos instalados") }
+                    OutlinedButton(enabled = !isRunning && benchmarkingModel == null && installedModels.any { it.name == selectedOnDeviceModel },
+                        onClick = { onBenchmarkModel(selectedOnDeviceModel) }) { Text("Medir modelo local") }
+                    benchmarkStage?.let { Text(it) }
+                    if (benchmarkingModel != null) TextButton(onClick = onCancelBenchmark) { Text("Cancelar medição") }
+                    benchmarkResults[selectedOnDeviceModel]?.let { BenchmarkResultBlock(it) }
+                } else DiagnosticsSection(
                     isBusy = isBusy,
                     statusMessage = statusMessage,
                     statusIsError = statusIsError,
@@ -284,17 +364,25 @@ private fun RootSection(
     statusMessage: String?,
     deviceRecommendation: ModelRecommendation?,
     installedModels: List<ModelFile>,
+    memoryCount: Int,
+    skillCount: Int,
     onOpen: (SettingsSection) -> Unit,
 ) {
     val palette = TalosColors.current
 
+    SectionHeader("Modelo e conexão")
     SettingsMenuRow(
         title = SettingsSection.RUNTIME.title,
         summary = modeSummary(settings.mode),
         onClick = { onOpen(SettingsSection.RUNTIME) },
     )
     SettingsMenuRow(
-        title = SettingsSection.CONNECTION.title,
+        title = SettingsSection.LOCAL_MODELS.title,
+        summary = "Buscar bundles LiteRT-LM compatíveis no Hugging Face",
+        onClick = { onOpen(SettingsSection.LOCAL_MODELS) },
+    )
+    if (settings.mode != ModelMode.ON_DEVICE) SettingsMenuRow(
+        title = if (settings.usingDesktopBridge) "Gateway do PC" else SettingsSection.CONNECTION.title,
         summary = providerSummary(settings),
         onClick = { onOpen(SettingsSection.CONNECTION) },
     )
@@ -303,6 +391,18 @@ private fun RootSection(
         summary = modelSummary(settings),
         onClick = { onOpen(SettingsSection.MODEL) },
     )
+    SectionHeader("Memória e procedimentos")
+    SettingsMenuRow(
+        title = SettingsSection.MEMORY.title,
+        summary = "$memoryCount entradas · ${if (settings.includesMemory) "em uso neste modo" else "inclusão automática desativada neste modo"}",
+        onClick = { onOpen(SettingsSection.MEMORY) },
+    )
+    SettingsMenuRow(
+        title = SettingsSection.SKILLS.title,
+        summary = "$skillCount procedimentos salvos",
+        onClick = { onOpen(SettingsSection.SKILLS) },
+    )
+    SectionHeader("Segurança e diagnóstico")
     SettingsMenuRow(
         title = SettingsSection.APPROVALS.title,
         summary = approvalsSummary(settings),
@@ -310,7 +410,7 @@ private fun RootSection(
     )
     SettingsMenuRow(
         title = SettingsSection.DIAGNOSTICS.title,
-        summary = diagnosticsSummary(isBusy, statusMessage),
+        summary = if (settings.mode == ModelMode.ON_DEVICE) "Verificação e desempenho no aparelho" else diagnosticsSummary(isBusy, statusMessage),
         onClick = { onOpen(SettingsSection.DIAGNOSTICS) },
     )
 
@@ -381,6 +481,256 @@ private fun SettingsMenuRow(
     }
 }
 
+@Composable
+private fun LocalModelCatalogSection(
+    bundles: List<HuggingFaceModelBundle>,
+    searchedQuery: String?,
+    busy: Boolean,
+    error: String?,
+    recommendation: ModelRecommendation?,
+    installedModels: List<ModelFile>,
+    download: LocalModelDownloadStatus?,
+    onSearch: (String) -> Unit,
+    onInstall: (HuggingFaceModelBundle) -> Unit,
+    onCancelDownload: () -> Unit,
+    onSelectModel: (String) -> Unit,
+) {
+    val palette = TalosColors.current
+    val context = LocalContext.current
+    var query by rememberSaveable { mutableStateOf(searchedQuery.orEmpty()) }
+    var pendingInstall by remember { mutableStateOf<HuggingFaceModelBundle?>(null) }
+
+    if (pendingInstall != null) {
+        val selected = pendingInstall!!
+        val estimatedFit = recommendation?.takeIf { it.runnable }
+            ?.let { selected.bytes <= it.modelFileBudgetBytes }
+        AlertDialog(
+            onDismissRequest = { pendingInstall = null },
+            title = { Text("Baixar e instalar este modelo?") },
+            text = {
+                Column {
+                    Text("${selected.repository}\n${selected.filename}")
+                    Text("Tamanho: ${selected.sizeLabel}", modifier = Modifier.padding(top = 8.dp))
+                    Text(
+                        text = when {
+                            recommendation?.runnable == false -> "Este aparelho não passou na checagem mínima para modelos locais."
+                            estimatedFit == true -> "O tamanho cabe no orçamento de RAM medido; a inicialização ainda depende do bundle e do runtime."
+                            estimatedFit == false -> "Este arquivo excede o orçamento de RAM medido e pode não carregar neste aparelho."
+                            else -> "Não foi possível estimar o encaixe de RAM neste aparelho."
+                        },
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                    Text("Licença: ${selected.license ?: "não informada"}")
+                    Text("SHA-256: ${selected.sha256}")
+                    Text(
+                        "O Talos vai baixar do Hugging Face, verificar o tamanho e o SHA-256 e só então salvar o arquivo na pasta de modelos. Os pesos passam a ocupar ${selected.sizeLabel} no armazenamento.",
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingInstall = null
+                    onInstall(selected)
+                }) {
+                    Text(if (estimatedFit == false || recommendation?.runnable == false) "Instalar mesmo assim" else "Baixar e instalar")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingInstall = null }) { Text("Cancelar") }
+            },
+        )
+    }
+
+    LaunchedEffect(Unit) {
+        if (searchedQuery == null) onSearch("")
+    }
+
+    Text(
+        "Busque no Hugging Face bundles .litertlm, o formato que o Talos usa no aparelho. " +
+            "Arquivos GGUF, safetensors e pesos comuns não são carregados diretamente pelo app.",
+        style = MaterialTheme.typography.bodyMedium,
+        color = palette.textSecondary,
+    )
+    Spacer(Modifier.height(12.dp))
+    OutlinedTextField(
+        value = query,
+        onValueChange = { query = it.take(100) },
+        modifier = Modifier.fillMaxWidth(),
+        singleLine = true,
+        label = { Text("Buscar modelo, ex.: Qwen3 ou Gemma") },
+    )
+    OutlinedButton(
+        onClick = { onSearch(query) },
+        enabled = !busy && download?.let { !it.complete && it.error == null } != true,
+        modifier = Modifier.padding(top = 8.dp),
+    ) {
+        if (busy) {
+            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+            Spacer(Modifier.width(8.dp))
+        }
+        Text(if (busy) "Buscando no Hugging Face…" else "Buscar modelos")
+    }
+
+    if (error != null) {
+        Text(
+            text = error,
+            color = palette.danger,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(top = 10.dp),
+        )
+    } else if (searchedQuery != null && !busy && bundles.isEmpty()) {
+        Text(
+            text = "Nenhum bundle .litertlm público encontrado para esta busca. Tente outro nome.",
+            color = palette.textSecondary,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(top = 10.dp),
+        )
+    }
+
+    download?.let { progress ->
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            shape = RoundedCornerShape(14.dp),
+            color = palette.surfaceVariant,
+            contentColor = palette.textPrimary,
+        ) {
+            Column(Modifier.padding(14.dp)) {
+                val status = when {
+                    progress.complete -> "Download verificado e instalado"
+                    progress.error != null -> "Falha ao instalar: ${progress.error}"
+                    progress.verifying -> "Verificando tamanho e SHA-256…"
+                    else -> "Baixando ${progress.bundle.title} · ${progressPercent(progress)}%"
+                }
+                Text(status, style = MaterialTheme.typography.bodyMedium)
+                if (!progress.complete && progress.error == null) {
+                    androidx.compose.material3.LinearProgressIndicator(
+                        progress = { progressFraction(progress) },
+                        modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    )
+                    TextButton(onClick = onCancelDownload) { Text("Cancelar download") }
+                }
+                if (progress.error != null) {
+                    TextButton(onClick = { pendingInstall = progress.bundle }) { Text("Tentar novamente") }
+                }
+                if (progress.complete) {
+                    Text("Agora você pode selecionar em ‘Onde roda o modelo’.", modifier = Modifier.padding(top = 4.dp))
+                }
+            }
+        }
+    }
+
+    if (bundles.isNotEmpty()) {
+        val queryLabel = searchedQuery?.takeIf(String::isNotBlank)?.let { " para ‘$it’" }.orEmpty()
+        Text(
+            text = "${bundles.size} bundles encontrados$queryLabel",
+            style = MaterialTheme.typography.titleSmall,
+            color = palette.textPrimary,
+            modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
+        )
+    }
+
+    bundles.forEach { bundle ->
+        val fileName = bundle.filename.substringAfterLast('/')
+        val installed = installedModels.firstOrNull {
+            it.name.equals(fileName, ignoreCase = true) ||
+                it.name.equals("${bundle.repository.substringBefore('/')}__$fileName", ignoreCase = true)
+        }
+        val alreadyInstalled = installed != null
+        val fitsEstimate = recommendation?.takeIf { it.runnable }
+            ?.let { bundle.bytes <= it.modelFileBudgetBytes }
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp),
+            shape = RoundedCornerShape(14.dp),
+            color = palette.surfaceElevated,
+            contentColor = palette.textPrimary,
+        ) {
+            Column(Modifier.padding(14.dp)) {
+                Text(
+                    text = bundle.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = bundle.repository,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.textFaint,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+                Text(
+                    text = "$fileName · ${bundle.sizeLabel}",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = palette.textSecondary,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+                Text(
+                    text = when {
+                        alreadyInstalled -> "Este arquivo já está instalado"
+                        fitsEstimate == true -> "Tamanho dentro do orçamento de RAM medido"
+                        fitsEstimate == false -> "Acima do orçamento de RAM medido"
+                        else -> "Não foi possível estimar o encaixe neste aparelho"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = when {
+                        alreadyInstalled || fitsEstimate == true -> palette.brandInk
+                        fitsEstimate == false -> palette.caution
+                        else -> palette.textSecondary
+                    },
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                val license = bundle.license?.replace('-', ' ') ?: "não informada"
+                Text(
+                    text = "Licença: $license · ${bundle.downloads} downloads no último mês",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.textFaint,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+                Text(
+                    text = "O tamanho é uma estimativa de encaixe, não garantia de execução. O Talos valida o bundle ao carregá-lo.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.textFaint,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                TextButton(
+                    onClick = {
+                        runCatching {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(bundle.repositoryUrl)))
+                        }
+                    },
+                    modifier = Modifier.padding(start = 0.dp, top = 4.dp),
+                ) { Text("Abrir repositório no Hugging Face") }
+                if (installed != null) {
+                    TextButton(onClick = { onSelectModel(installed.name) }) { Text("Usar este modelo") }
+                } else {
+                    TextButton(
+                        enabled = bundle.sha256?.matches(Regex("[a-fA-F0-9]{64}")) == true &&
+                            (download == null || download.complete || download.error != null),
+                        onClick = { pendingInstall = bundle },
+                    ) {
+                        Text(
+                            if (bundle.sha256?.matches(Regex("[a-fA-F0-9]{64}")) == true) {
+                                "Baixar e instalar"
+                            } else {
+                                "Sem SHA-256 verificável"
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun progressFraction(status: LocalModelDownloadStatus): Float =
+    if (status.totalBytes <= 0L) 0f
+    else (status.downloadedBytes.toDouble() / status.totalBytes).toFloat().coerceIn(0f, 1f)
+
+private fun progressPercent(status: LocalModelDownloadStatus): Int =
+    (progressFraction(status) * 100f).toInt()
+
 // ---------------------------------------------------------------------------
 // Onde roda o modelo
 // ---------------------------------------------------------------------------
@@ -409,6 +759,7 @@ private fun RuntimeSection(
     onSelectModel: (String) -> Unit,
     onBenchmarkModel: (String) -> Unit,
     onCancelBenchmark: () -> Unit,
+    allowModeChange: Boolean,
 ) {
     val palette = TalosColors.current
 
@@ -421,11 +772,11 @@ private fun RuntimeSection(
     Spacer(modifier = Modifier.height(12.dp))
 
     ModeOptionRow(
-        title = "Neste celular",
+        title = "Na nuvem",
         description = "O aparelho só monta a conversa e envia pela internet; a resposta " +
             "vem do provedor em nuvem configurado, sem gastar bateria com inferência.",
         selected = settings.mode == ModelMode.CLOUD,
-        enabled = true,
+        enabled = allowModeChange,
         onClick = onUseCloud,
     )
 
@@ -434,7 +785,7 @@ private fun RuntimeSection(
         description = "As chamadas passam pelo gateway do Talos no computador, que executa " +
             "o agente com o espaço e as ferramentas do desktop. Precisa da chave do gateway.",
         selected = settings.mode == ModelMode.DESKTOP,
-        enabled = true,
+        enabled = allowModeChange,
         onClick = onUsePc,
     )
 
@@ -445,7 +796,7 @@ private fun RuntimeSection(
         description = "Os pesos rodam dentro do app, sem rede. Mais lento e limitado pelo " +
             "modelo que couber na memória do aparelho.",
         selected = settings.mode == ModelMode.ON_DEVICE,
-        enabled = recommendation?.runnable != false,
+        enabled = allowModeChange && recommendation?.runnable != false,
         onClick = onUseOnDevice,
     )
 
@@ -793,199 +1144,15 @@ private fun ModeOptionRow(
 // ---------------------------------------------------------------------------
 
 @Composable
-private fun ConnectionSection(
-    settings: TalosSettings,
-    onApiKeyChange: (String) -> Unit,
-    onProviderChange: (String) -> Unit,
-    onBaseUrlChange: (String) -> Unit,
-    onUseLocalGateway: () -> Unit,
-    onGatewayApiKeyChange: (String) -> Unit,
-) {
-    val palette = TalosColors.current
-
-    // Presentation-only: whether the API key is shown in clear text. Deliberately
-    // NOT rememberSaveable — a secret should not be re-exposed after process death.
-    var apiKeyVisible by remember { mutableStateOf(false) }
-    var gatewayKeyVisible by remember { mutableStateOf(false) }
-    var providerExpanded by remember { mutableStateOf(false) }
-
-    OutlinedTextField(
-        value = settings.apiKey,
-        onValueChange = onApiKeyChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text(text = "Chave de API") },
-        singleLine = true,
-        shape = RoundedCornerShape(12.dp),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-        visualTransformation = if (apiKeyVisible) {
-            VisualTransformation.None
-        } else {
-            PasswordVisualTransformation()
-        },
-        trailingIcon = {
-            // Text instead of an eye icon: material-icons-extended is not a
-            // dependency (it would add ~10 MB), and the core icon set has no
-            // visibility glyphs.
-            TextButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
-                Text(
-                    text = if (apiKeyVisible) "Ocultar" else "Mostrar",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TalosColors.current.brandInk,
-                )
-            }
-        },
-    )
-
-    Spacer(modifier = Modifier.height(14.dp))
-
-    Box(modifier = Modifier.fillMaxWidth()) {
-        OutlinedButton(
-            onClick = { providerExpanded = true },
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp),
-        ) {
-            Text(text = "Provedor: ${settings.provider.displayName}")
-        }
-        DropdownMenu(
-            expanded = providerExpanded,
-            onDismissRequest = { providerExpanded = false },
-        ) {
-            ProviderCatalog.all.forEach { provider ->
-                DropdownMenuItem(
-                    text = { Text(text = provider.displayName) },
-                    onClick = {
-                        providerExpanded = false
-                        onProviderChange(provider.id)
-                    },
-                )
-            }
-        }
-    }
-
-    Spacer(modifier = Modifier.height(14.dp))
-
-    OutlinedTextField(
-        value = settings.baseUrl,
-        onValueChange = onBaseUrlChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text(text = "URL base") },
-        singleLine = true,
-        shape = RoundedCornerShape(12.dp),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-    )
-
-    Spacer(modifier = Modifier.height(6.dp))
-    Text(
-        text = "O provedor selecionado preenche a URL, que continua editável para " +
-            "servidores personalizados. Um gateway compatível com OpenAI rodando " +
-            "no PC (padrão ${TalosSettings.LOCAL_GATEWAY_BASE_URL}) roteia as " +
-            "chamadas pelo agente do desktop.",
-        style = MaterialTheme.typography.bodyMedium,
-        color = palette.textFaint,
-    )
-    Spacer(modifier = Modifier.height(8.dp))
-    SuggestionChip(
-        onClick = onUseLocalGateway,
-        label = { Text(text = "Usar gateway local") },
-    )
-
-    Spacer(modifier = Modifier.height(14.dp))
-
-    // The gateway authenticates with its own secret, separate from the DeepSeek
-    // key. Keeping them in distinct fields is what stops one being sent to the
-    // other's endpoint — the failure that motivated this field.
-    OutlinedTextField(
-        value = settings.gatewayApiKey,
-        onValueChange = onGatewayApiKeyChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text(text = "Chave do gateway (API_SERVER_KEY)") },
-        singleLine = true,
-        shape = RoundedCornerShape(12.dp),
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-        visualTransformation = if (gatewayKeyVisible) {
-            VisualTransformation.None
-        } else {
-            PasswordVisualTransformation()
-        },
-        trailingIcon = {
-            TextButton(onClick = { gatewayKeyVisible = !gatewayKeyVisible }) {
-                Text(
-                    text = if (gatewayKeyVisible) "Ocultar" else "Mostrar",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TalosColors.current.brandInk,
-                )
-            }
-        },
-    )
-    Text(
-        text = "Usada só no modo PC. No Mac: openssl rand -hex 32, e a mesma em API_SERVER_KEY.",
-        style = MaterialTheme.typography.labelSmall,
-        color = palette.textFaint,
-        modifier = Modifier.padding(top = 4.dp),
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Modelo
-// ---------------------------------------------------------------------------
-
-@Composable
 private fun ModelSection(
     settings: TalosSettings,
-    availableModels: List<ProviderModel>,
-    onModelChange: (String) -> Unit,
+    onEditModel: () -> Unit,
     onTemperatureChange: (Double) -> Unit,
 ) {
     val palette = TalosColors.current
-    var modelsExpanded by remember(settings.providerId) { mutableStateOf(false) }
-
-    OutlinedTextField(
-        value = settings.model,
-        onValueChange = onModelChange,
-        modifier = Modifier.fillMaxWidth(),
-        label = { Text(text = "Modelo") },
-        singleLine = true,
-        shape = RoundedCornerShape(12.dp),
-    )
-
-    if (availableModels.isNotEmpty()) {
-        Spacer(modifier = Modifier.height(10.dp))
-        val selectedModel = availableModels.firstOrNull { it.id == settings.model }
-        Box(modifier = Modifier.fillMaxWidth()) {
-            OutlinedButton(
-                onClick = { modelsExpanded = true },
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-            ) {
-                Text(text = "Modelos disponíveis: ${selectedModel?.name ?: "Escolher"}")
-            }
-            DropdownMenu(
-                expanded = modelsExpanded,
-                onDismissRequest = { modelsExpanded = false },
-            ) {
-                availableModels.forEach { model ->
-                    DropdownMenuItem(
-                        text = {
-                            Column {
-                                Text(text = model.name)
-                                if (model.name != model.id) {
-                                    Text(
-                                        text = model.id,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = TalosColors.current.textFaint,
-                                    )
-                                }
-                            }
-                        },
-                        onClick = {
-                            modelsExpanded = false
-                            onModelChange(model.id)
-                        },
-                    )
-                }
-            }
-        }
-    }
+    Text("Modelo ativo", style = MaterialTheme.typography.titleMedium)
+    Text(settings.effectiveModel.ifBlank { "Nenhum modelo configurado" })
+    TextButton(onClick = onEditModel) { Text(if (settings.mode == ModelMode.ON_DEVICE) "Escolher modelo instalado" else "Configurar conexão e modelo") }
 
     Spacer(modifier = Modifier.height(18.dp))
 
@@ -1039,9 +1206,8 @@ private fun ApprovalsSection(
     val approved = settings.autoApprovedTools.sorted()
 
     Text(
-        text = "Toda ferramenta que não seja de leitura segura pausa e pede " +
-            "confirmação antes de executar. As ferramentas abaixo foram liberadas " +
-            "para sempre.",
+        text = "Estas liberações dispensam a confirmação para toda a ferramenta, em qualquer conversa futura, até você revogar. " +
+            "Uma liberação de shell vale para qualquer comando. As tarefas agendadas mantêm sua política própria.",
         style = MaterialTheme.typography.bodyMedium,
         color = palette.textSecondary,
     )
@@ -1070,7 +1236,7 @@ private fun ApprovalsSection(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            text = toolName,
+                            text = approvalLabel(toolName),
                             modifier = Modifier.weight(1f),
                             style = MaterialTheme.typography.bodyMedium,
                             fontFamily = FontFamily.Monospace,
@@ -1089,7 +1255,7 @@ private fun ApprovalsSection(
             onClick = onClearApprovals,
             shape = RoundedCornerShape(12.dp),
         ) {
-            Text(text = "Limpar tudo")
+            Text(text = "Revogar todas as aprovações")
         }
     }
 }
@@ -1108,10 +1274,9 @@ private fun DiagnosticsSection(
 ) {
     val palette = TalosColors.current
 
-    Row(
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         OutlinedButton(
             onClick = onFetchModels,
@@ -1239,3 +1404,20 @@ private fun SectionHeader(text: String) {
 /** One decimal, locale-independent so the readout matches the API's expectations. */
 private fun formatTemperature(value: Double): String =
     String.format(Locale.US, "%.1f", value)
+
+private fun approvalLabel(name: String): String = when (name) {
+    "shell" -> "Executar comandos (shell)"
+    "memory" -> "Ler e alterar memórias"
+    "skill" -> "Ler e gerenciar skills"
+    "session_search" -> "Buscar no histórico de conversas"
+    "read_file" -> "Ler arquivos"
+    "write_file" -> "Gravar arquivos"
+    "fetch_url" -> "Acessar endereços da rede"
+    "contacts_search" -> "Consultar contatos"
+    "calendar_read" -> "Consultar calendário"
+    "clipboard_read" -> "Ler área de transferência"
+    "clipboard_write" -> "Alterar área de transferência"
+    "open_url" -> "Abrir links e aplicativos"
+    "notify" -> "Enviar notificações"
+    else -> name
+}

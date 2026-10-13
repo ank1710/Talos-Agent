@@ -96,7 +96,6 @@ private const val MAX_BLOCKS = 4000
 
 private val HeadingRegex = Regex(""" {0,3}(#{1,6})[ \t]+(.*)""")
 private val BulletRegex = Regex("""^ {0,3}[-*+][ \t]+(.*)$""")
-private val OrderedRegex = Regex("""^ {0,3}(\d{1,9})[.)][ \t]+(.*)$""")
 private val FenceRegex = Regex("""^ {0,3}(`{3,}|~{3,})(.*)$""")
 private val RuleRegex = Regex("""^ {0,3}(?:-{3,}|\*{3,}|_{3,})[ \t]*$""")
 private val TableDelimiterRegex = Regex("""^ {0,3}\|?[ \t]*:?-{1,}:?[ \t]*(\|[ \t]*:?-{1,}:?[ \t]*)*\|?[ \t]*$""")
@@ -249,17 +248,14 @@ fun parseMarkdown(source: String): List<MdBlock> {
             continue
         }
 
-        val ordered = OrderedRegex.find(line)
+        val ordered = parseOrderedListLine(line)
         if (ordered != null) {
             flushOpenParagraph()
             val items = ArrayList<OrderedItem>()
             var cursor = index
             while (cursor < lines.size && items.size < MAX_LINES) {
-                val match = OrderedRegex.find(lines[cursor]) ?: break
-                val marker = match.groupValues[2]
-                if (marker.isEmpty()) break
-                val number = match.groupValues[1].toIntOrNull() ?: (items.size + 1)
-                items.add(OrderedItem(number, marker, marker.trim()))
+                val parsed = parseOrderedListLine(lines[cursor]) ?: break
+                items.add(OrderedItem(parsed.number, parsed.delimiter.toString(), parsed.text.trim()))
                 cursor++
             }
             if (items.isEmpty()) {

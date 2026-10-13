@@ -15,6 +15,7 @@ import com.talos.harness.agent.Conversation
 import com.talos.harness.agent.MessageStatus
 import com.talos.harness.agent.Risk
 import com.talos.harness.agent.Role
+import com.talos.harness.agent.PersistentContext
 import com.talos.harness.agent.SystemPrompt
 import com.talos.harness.agent.newId
 import com.talos.harness.gateway.GatewayApprovalClient
@@ -29,6 +30,9 @@ import com.talos.harness.llm.WireUsage
 import com.talos.harness.local.BenchmarkResult
 import com.talos.harness.local.DeviceCapability
 import com.talos.harness.local.DeviceProfile
+import com.talos.harness.local.HuggingFaceModelBundle
+import com.talos.harness.local.HuggingFaceModelCatalog
+import com.talos.harness.local.HuggingFaceModelInstaller
 import com.talos.harness.local.LocalBackend
 import com.talos.harness.local.ModelFile
 import com.talos.harness.local.ModelRecommendation
@@ -39,6 +43,11 @@ import com.talos.harness.media.MediaResolver
 import com.talos.harness.schedule.ScheduleScheduler
 import com.talos.harness.schedule.ScheduledTask
 import com.talos.harness.schedule.ScheduledTaskStore
+import com.talos.harness.store.ConnectionDraft
+import com.talos.harness.store.MemoryEntry
+import com.talos.harness.store.MemoryStore
+import com.talos.harness.store.SkillEntry
+import com.talos.harness.store.SkillStore
 import com.talos.harness.store.ConversationStore
 import com.talos.harness.store.ConversationSummary
 import com.talos.harness.store.ModelMode
@@ -54,6 +63,9 @@ import com.talos.harness.tools.DeviceInfoTool
 import com.talos.harness.tools.FetchUrlTool
 import com.talos.harness.tools.ListAppsTool
 import com.talos.harness.tools.ListDirTool
+import com.talos.harness.tools.MemoryTool
+import com.talos.harness.tools.SkillTool
+import com.talos.harness.tools.SessionSearchTool
 import com.talos.harness.tools.NotifyTool
 import com.talos.harness.tools.OpenUrlTool
 import com.talos.harness.tools.ReadFileTool
@@ -73,6 +85,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -133,7 +146,33 @@ data class ChatUiState(
      * must land on the same entry.
      */
     val benchmarkResults: Map<String, BenchmarkResult> = emptyMap(),
+    /** Remote LiteRT-LM bundles found in the public Hugging Face catalog. */
+    val localModelBundles: List<HuggingFaceModelBundle> = emptyList(),
+    val localModelSearchQuery: String? = null,
+    val localModelSearchBusy: Boolean = false,
+    val localModelSearchError: String? = null,
+    val localModelDownload: LocalModelDownloadStatus? = null,
+    val memories: List<MemoryEntry> = emptyList(),
+    val skills: List<SkillEntry> = emptyList(),
+    val memoryError: String? = null,
+    val skillsError: String? = null,
+    val persistenceBusy: Boolean = false,
+    val memoryDirectory: String = "",
+    val skillsDirectory: String = "",
 ) {
+    val persistentToolsAvailable: Boolean get() = !onDevice ||
+        Regex("ekv(\\d+)", RegexOption.IGNORE_CASE).find(settings.model)?.groupValues?.get(1)?.toIntOrNull()
+            ?.let { it >= 4096 } ?: true
+
+    val skillExecutionUnavailable: String? get() = when {
+        isRunning -> "Espere a tarefa atual terminar para executar uma skill."
+        persistenceBusy -> "Uma alteração está sendo salva."
+        needsSetup -> "Configure a conexão e a chave do modelo para executar skills."
+        onDevice && installedModels.none { it.name == onDeviceModel } -> "Selecione um modelo instalado no aparelho."
+        !persistentToolsAvailable -> "O modelo selecionado tem janela pequena. Escolha um modelo com pelo menos 4096 tokens."
+        else -> null
+    }
+
     val needsSetup: Boolean get() = !settings.isConfigured
 
     /**
@@ -152,6 +191,15 @@ data class ChatUiState(
             settings.model.contains("vl", ignoreCase = true)
 }
 
+data class LocalModelDownloadStatus(
+    val bundle: HuggingFaceModelBundle,
+    val downloadedBytes: Long,
+    val totalBytes: Long,
+    val verifying: Boolean = false,
+    val complete: Boolean = false,
+    val error: String? = null,
+)
+
 /**
  * Owns the conversation, drives [AgentLoop], and answers approval requests.
  *
@@ -167,11 +215,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val taskStore = ScheduledTaskStore(app.filesDir)
     private val voice = VoiceController(app)
     private val conversationStore = ConversationStore(app.filesDir)
+    private val memoryStore = MemoryStore(app.filesDir)
+    private val skillStore = SkillStore(app.filesDir)
     private val client = DeepSeekClient()
     private val gatewayClient = GatewayApprovalClient()
 
     /** Shared: the view model resolves names for the preload, the engine for the request. */
     private val modelStore = ModelStore(appContext)
+    private val huggingFaceModelCatalog = HuggingFaceModelCatalog()
+    private val huggingFaceModelInstaller = HuggingFaceModelInstaller(modelStore)
 
     /**
      * Measured once per process. The probe reads free RAM, the ABI list and the
@@ -197,7 +249,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     )
 
     private val workspace = File(app.filesDir, "workspace").apply { mkdirs() }
-    private val toolContext = ToolContext(app, workspace)
+    private val toolContext = ToolContext(app, workspace, interactive = true)
 
     /**
      * The context window below which describing the whole tool catalogue is not
@@ -249,6 +301,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             backend = backend,
             settings = settings,
             approvals = if (settings.usingDesktopBridge) gatewayGate else approvalGate,
+            origin = "conversa: ${_state.value.conversation.id}",
         )
 
     /**
@@ -270,6 +323,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         backend: ChatBackend,
         settings: TalosSettings,
         approvals: ApprovalGate,
+        origin: String,
     ): ToolRegistry {
         // Which tools this run may describe to the model.
         //
@@ -315,6 +369,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // Network. CAUTION: an unattended run must not be able to POST
                 // your data anywhere without you opting that task in.
                 add(FetchUrlTool())
+                add(MemoryTool(memoryStore, origin))
+                add(SessionSearchTool(conversationStore))
+                add(SkillTool(skillStore, origin))
             }
         }
 
@@ -328,7 +385,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // to skip a confirmation the user would have been asked for.
                 approvals = approvals,
                 toolContext = toolContext,
-                registryFactory = { next -> buildTools(next, backend, settings, approvals) },
+                registryFactory = { next -> buildTools(next, backend, settings, approvals, origin) },
                 apiKey = settings.effectiveApiKey,
                 baseUrl = settings.baseUrl,
                 model = settings.effectiveModel,
@@ -345,6 +402,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var runJob: Job? = null
     private var modelFetchJob: Job? = null
     private var benchmarkJob: Job? = null
+    private var localModelSearchJob: Job? = null
+    private var localModelDownloadJob: Job? = null
     private var approvalDeferred: CompletableDeferred<ApprovalDecision>? = null
 
     private data class ActiveGatewayRun(
@@ -414,6 +473,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         refreshConversations()
+        refreshPersistentData()
         refreshTasks()
         // Read the models directory up front: the drawer needs to know whether a
         // local run is even possible before the user picks that mode.
@@ -802,6 +862,62 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun stopSpeaking() = voice.stopSpeaking()
 
+    // UI writes originate from explicit edits; agent writes use approval-gated tools.
+    fun refreshPersistentData() {
+        viewModelScope.launch { loadPersistentData() }
+    }
+
+    private suspend fun loadPersistentData() {
+        // A damaged skill must not prevent the user from viewing or fixing memories.
+        try {
+            val memories = memoryStore.list()
+            _state.update { it.copy(memories = memories, memoryError = null, memoryDirectory = memoryStore.directory) }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { _state.update { it.copy(memoryError = e.message ?: "Falha ao ler memórias.") } }
+        try {
+            val skills = skillStore.list()
+            _state.update { it.copy(skills = skills, skillsError = null, skillsDirectory = skillStore.directory) }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { _state.update { it.copy(skillsError = e.message ?: "Falha ao ler skills.") } }
+    }
+
+    private suspend fun changePersistentData(change: suspend () -> Unit): Result<Unit> {
+        if (_state.value.persistenceBusy || _state.value.isRunning)
+            return Result.failure(IllegalStateException("Espere a tarefa ou gravação atual terminar. A leitura continua disponível."))
+        _state.update { it.copy(persistenceBusy = true) }
+        return try {
+            change()
+            loadPersistentData()
+            Result.success(Unit)
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { Result.failure(e) }
+        finally { _state.update { it.copy(persistenceBusy = false) } }
+    }
+
+    suspend fun saveMemory(id: String?, text: String): Result<Unit> = changePersistentData {
+        if (id == null) memoryStore.save(text, "usuário: ajustes") else memoryStore.edit(id, text)
+    }
+    suspend fun deleteMemory(id: String): Result<Unit> = changePersistentData { memoryStore.forget(id) }
+    suspend fun saveSkill(name: String, title: String, description: String, steps: String, create: Boolean): Result<Unit> = changePersistentData {
+        skillStore.save(name, description, steps, "usuário: ajustes", create, title)
+    }
+    suspend fun deleteSkill(name: String): Result<Unit> = changePersistentData { skillStore.delete(name) }
+    suspend fun setMemoryPolicy(enabled: Boolean, remote: Boolean): Result<Unit> = try {
+        settingsRepo.setMemoryPolicy(enabled, remote)
+        val saved = settingsRepo.flow.first()
+        _state.update { it.copy(settings = saved) }
+        Result.success(Unit)
+    } catch (e: CancellationException) { throw e }
+    catch (e: Exception) { Result.failure(e) }
+
+    fun executeSkill(name: String): Boolean {
+        if (_state.value.skillExecutionUnavailable != null) return false
+        // Only the validated identifier becomes a user request, never the stored body.
+        if (!Regex("[a-z0-9][a-z0-9_-]{0,63}").matches(name)) return false
+        send("Execute a skill '$name': carregue os passos com skill/execute e realize as ações pertinentes, respeitando as aprovações.")
+        return true
+    }
+
     // --------------------------------------------------------- scheduled tasks
 
     /**
@@ -887,11 +1003,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
 
+                val compact = local && (declaredContextWindow(settings.model)?.let { it < FULL_TOOLSET_MIN_WINDOW } ?: false)
+                val context = PersistentContext.build(
+                    if (settings.includesMemory) memoryStore.list() else emptyList(), skillStore.list(),
+                    history.lastOrNull { it.role == Role.USER }?.content.orEmpty(), compact,
+                )
                 loop.run(
                     apiKey = settings.effectiveApiKey,
                     baseUrl = settings.baseUrl,
                     model = settings.effectiveModel,
-                    systemPrompt = SystemPrompt.build(workspace.absolutePath),
+                    systemPrompt = SystemPrompt.build(workspace.absolutePath, compact, context, persistentTools = !compact),
                     history = history,
                     temperature = settings.temperature,
                 ).collect(::handle)
@@ -985,7 +1106,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
             is AgentEvent.ToolStarted -> Unit
 
-            is AgentEvent.ToolFinished -> upsert(event.message)
+            is AgentEvent.ToolFinished -> {
+                upsert(event.message)
+                if (event.message.toolName in setOf("memory", "skill", "spawn_subagent")) refreshPersistentData()
+            }
 
             // The gate already published the request through ChatUiState.
             is AgentEvent.ApprovalRequired -> Unit
@@ -1089,48 +1213,35 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------------------------------------------------------- settings
 
-    fun updateApiKey(value: String) = viewModelScope.launch { settingsRepo.setApiKey(value) }
-
-    fun updateBaseUrl(value: String) {
-        // Update the value checked by a pending gateway approval before the
-        // asynchronous DataStore write can make that origin change visible.
-        _state.update { it.copy(settings = it.settings.copy(baseUrl = value)) }
-        viewModelScope.launch { settingsRepo.setBaseUrl(value) }
+    suspend fun saveConnection(draft: ConnectionDraft): Result<Unit> {
+        if (_state.value.isRunning) return Result.failure(IllegalStateException("Espere a conversa atual terminar antes de mudar a conexão."))
+        return try {
+            settingsRepo.saveConnection(draft)
+            val saved = settingsRepo.flow.first()
+            _state.update { it.copy(settings = saved, availableModels = emptyList(), statusMessage = null, isBusy = false) }
+            Result.success(Unit)
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { Result.failure(e) }
     }
 
-    /** Saves one provider, switches to its known URL, then refreshes its model list. */
-    fun selectProvider(providerId: String) {
-        val current = _state.value.settings
-        val provider = ProviderCatalog.byId(providerId) ?: ProviderCatalog.CUSTOM
-        val modelOverride = provider.defaultModel.takeIf { current.mode != ModelMode.ON_DEVICE }
-        val selected = current.copy(
-            providerId = provider.id,
-            baseUrl = provider.baseUrl ?: current.baseUrl,
-            model = modelOverride ?: current.model,
-        )
-        viewModelScope.launch {
-            settingsRepo.selectProvider(provider.id, modelOverride = modelOverride)
-            fetchModels(selected)
-        }
+    suspend fun testConnectionDraft(draft: ConnectionDraft): Result<Unit> {
+        draft.validation(requireModel = false)?.let { return Result.failure(IllegalArgumentException(it)) }
+        return try {
+            val error = client.probe(draft.boundKey, draft.baseUrl.trim(), draft.provider)
+            if (error == null) Result.success(Unit) else Result.failure(IllegalStateException(error))
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { Result.failure(e) }
     }
 
-    /** The settings shortcut keeps the existing gateway mode detection and key split. */
-    fun useLocalGateway() {
-        val current = _state.value.settings
-        val selected = current.copy(
-            providerId = ProviderCatalog.CUSTOM.id,
-            baseUrl = TalosSettings.LOCAL_GATEWAY_BASE_URL,
-        )
-        viewModelScope.launch {
-            settingsRepo.selectProvider(
-                providerId = ProviderCatalog.CUSTOM.id,
-                baseUrlOverride = TalosSettings.LOCAL_GATEWAY_BASE_URL,
-            )
-            fetchModels(selected)
-        }
+    suspend fun fetchDraftModels(draft: ConnectionDraft): Result<List<ProviderModel>> {
+        draft.validation(requireModel = false)?.let { return Result.failure(IllegalArgumentException(it)) }
+        return try {
+            val models = client.listModels(draft.boundKey, draft.baseUrl.trim(), draft.provider)
+            if (models.isEmpty()) Result.failure(IllegalStateException("Nenhum modelo retornado. Verifique o endereço e a chave ou informe o modelo manualmente."))
+            else Result.success(models)
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { Result.failure(e) }
     }
-
-    fun updateModel(value: String) = viewModelScope.launch { settingsRepo.setModel(value) }
 
     fun updateTemperature(value: Double) = viewModelScope.launch { settingsRepo.setTemperature(value) }
 
@@ -1157,6 +1268,107 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Searches only public Hugging Face repositories that advertise LiteRT-LM bundles. */
+    fun searchLocalModels(query: String) {
+        localModelSearchJob?.cancel()
+        localModelSearchJob = viewModelScope.launch {
+            _state.update {
+                it.copy(
+                    localModelBundles = emptyList(),
+                    localModelSearchQuery = query.trim().take(100),
+                    localModelSearchBusy = true,
+                    localModelSearchError = null,
+                )
+            }
+            try {
+                val models = huggingFaceModelCatalog.search(query)
+                _state.update {
+                    it.copy(
+                        localModelBundles = models,
+                        localModelSearchBusy = false,
+                        localModelSearchError = null,
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        localModelBundles = emptyList(),
+                        localModelSearchBusy = false,
+                        localModelSearchError = e.message ?: "Não foi possível buscar modelos no Hugging Face.",
+                    )
+                }
+            }
+        }
+    }
+
+    /** Installs a selected catalog bundle only after the settings UI confirms it. */
+    fun installLocalModel(bundle: HuggingFaceModelBundle) {
+        if (localModelDownloadJob?.isActive == true) return
+        localModelDownloadJob = viewModelScope.launch {
+            _state.update {
+                it.copy(
+                    localModelDownload = LocalModelDownloadStatus(
+                        bundle = bundle,
+                        downloadedBytes = 0L,
+                        totalBytes = bundle.bytes,
+                    ),
+                )
+            }
+            try {
+                huggingFaceModelInstaller.install(bundle) { downloaded, total, verifying ->
+                    _state.update { state ->
+                        state.copy(
+                            localModelDownload = LocalModelDownloadStatus(
+                                bundle = bundle,
+                                downloadedBytes = downloaded,
+                                totalBytes = total,
+                                verifying = verifying,
+                            ),
+                        )
+                    }
+                }
+                val (directory, installed) = withContext(Dispatchers.IO) {
+                    modelStore.directory().absolutePath to modelStore.installed()
+                }
+                _state.update {
+                    it.copy(
+                        installedModels = installed,
+                        modelsDirectory = directory,
+                        localModelDownload = LocalModelDownloadStatus(
+                            bundle = bundle,
+                            downloadedBytes = bundle.bytes,
+                            totalBytes = bundle.bytes,
+                            complete = true,
+                        ),
+                    )
+                }
+            } catch (e: CancellationException) {
+                _state.update { it.copy(localModelDownload = null) }
+                throw e
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        localModelDownload = LocalModelDownloadStatus(
+                            bundle = bundle,
+                            downloadedBytes = 0L,
+                            totalBytes = bundle.bytes,
+                            error = e.message ?: "Não foi possível instalar o bundle.",
+                        ),
+                    )
+                }
+            } finally {
+                localModelDownloadJob = null
+            }
+        }
+    }
+
+    fun cancelLocalModelDownload() {
+        localModelDownloadJob?.cancel()
+        localModelDownloadJob = null
+    }
+
     /**
      * Routes requests through the Talos gateway on the desktop.
      *
@@ -1166,29 +1378,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * [TalosSettings.effectiveApiKey] and friends encode that rule in one place,
      * shared with the unattended worker.
      */
-    fun useDesktopBridge() {
+    private fun switchRemoteMode(mode: ModelMode) {
+        if (_state.value.isRunning) return
         viewModelScope.launch {
-            settingsRepo.setMode(ModelMode.DESKTOP)
-            settingsRepo.selectProvider(
-                providerId = ProviderCatalog.CUSTOM.id,
-                baseUrlOverride = TalosSettings.LOCAL_GATEWAY_BASE_URL,
-                modelOverride = TalosSettings.GATEWAY_MODEL,
-            )
-            _state.update { it.copy(statusMessage = "Rodando no PC.", statusIsError = false) }
+            try {
+                settingsRepo.setMode(mode)
+                _state.update { it.copy(availableModels = emptyList(), statusMessage = null, isBusy = false) }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                _state.update { it.copy(statusMessage = "Não foi possível mudar o modo.", statusIsError = true) }
+            }
         }
     }
 
-    /** Goes back to calling DeepSeek directly from the phone. */
-    fun useCloud() {
-        viewModelScope.launch {
-            settingsRepo.setMode(ModelMode.CLOUD)
-            settingsRepo.selectProvider(
-                providerId = ProviderCatalog.DEEPSEEK.id,
-                modelOverride = TalosSettings.DEFAULT_MODEL,
-            )
-            _state.update { it.copy(statusMessage = "Rodando na nuvem.", statusIsError = false) }
-        }
-    }
+    fun useDesktopBridge() = switchRemoteMode(ModelMode.DESKTOP)
+    fun useCloud() = switchRemoteMode(ModelMode.CLOUD)
 
     /**
      * Switches to the model running on this phone.
@@ -1201,6 +1405,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * clobbering a name the user may still want.
      */
     fun useOnDeviceModel() {
+        if (_state.value.isRunning) return
         viewModelScope.launch {
             val recommendation = deviceProfile?.recommendation
             val (directory, installed) = withContext(Dispatchers.IO) {
@@ -1211,16 +1416,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // last word, and re-pointing the field on every mode switch would
             // undo that choice exactly the way the old behaviour did.
             val forced = installed.firstOrNull {
-                it.name.equals(_state.value.settings.model.trim(), ignoreCase = true)
+                it.name.equals(_state.value.settings.localModel.trim(), ignoreCase = true)
             }
             val chosen = forced ?: modelStore.default(recommendation)
-            settingsRepo.setMode(ModelMode.ON_DEVICE)
-            chosen?.let { settingsRepo.setModel(it.name) }
+            settingsRepo.setMode(ModelMode.ON_DEVICE, chosen?.name)
             val overBudget = chosen != null &&
                 recommendation != null &&
                 chosen.bytes > recommendation.modelFileBudgetBytes
             _state.update {
                 it.copy(
+                    isBusy = false, availableModels = emptyList(),
                     installedModels = installed,
                     modelsDirectory = directory,
                     deviceRecommendation = recommendation,
@@ -1251,13 +1456,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * instead of being overwritten by [useOnDeviceModel]'s automatic pick.
      */
     fun selectOnDeviceModel(name: String) {
+        if (_state.value.isRunning) return
         val model = _state.value.installedModels.firstOrNull { it.name == name } ?: return
         viewModelScope.launch {
             // The list only exists under ON_DEVICE, but setting the mode here
             // keeps the invariant if that ever changes: choosing a local bundle
             // means the phone runs it.
-            settingsRepo.setMode(ModelMode.ON_DEVICE)
-            settingsRepo.setModel(model.name)
+            settingsRepo.setMode(ModelMode.ON_DEVICE, model.name)
             _state.update {
                 it.copy(
                     statusMessage = "Modelo escolhido: ${model.name} (${model.sizeLabel}).",
@@ -1335,16 +1540,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         benchmarkJob = null
     }
 
-    fun updateGatewayApiKey(value: String) {
-        _state.update { it.copy(settings = it.settings.copy(gatewayApiKey = value)) }
-        viewModelScope.launch { settingsRepo.setGatewayApiKey(value) }
-    }
-
     fun revokeApproval(toolName: String) = viewModelScope.launch { settingsRepo.revokeApproval(toolName) }
 
     fun clearApprovals() = viewModelScope.launch { settingsRepo.clearApprovals() }
 
     fun fetchModels() {
+        if (_state.value.onDevice) { refreshInstalledModels(); return }
         fetchModels(_state.value.settings)
     }
 
@@ -1373,6 +1574,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 baseUrl = settings.baseUrl,
                 provider = settings.provider,
             )
+            if (!isCurrentConnection(settings)) return@launch
             _state.update {
                 it.copy(
                     isBusy = false,
@@ -1388,7 +1590,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun isCurrentConnection(snapshot: TalosSettings): Boolean {
+        val current = _state.value.settings
+        return current.mode == snapshot.mode && current.providerId == snapshot.providerId &&
+            current.baseUrl == snapshot.baseUrl && current.effectiveApiKey == snapshot.effectiveApiKey
+    }
+
     fun testConnection() {
+        if (_state.value.onDevice) { benchmarkModel(_state.value.onDeviceModel); return }
         val settings = _state.value.settings
         viewModelScope.launch {
             val customRemoteMissingKey = settings.provider.id == ProviderCatalog.CUSTOM.id && !settings.isConfigured
@@ -1407,6 +1616,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
             _state.update { it.copy(isBusy = true, statusMessage = "Testando conexão…", statusIsError = false) }
             val failure = client.probe(settings.effectiveApiKey, settings.baseUrl, settings.provider)
+            if (!isCurrentConnection(settings)) return@launch
             _state.update {
                 it.copy(
                     isBusy = false,

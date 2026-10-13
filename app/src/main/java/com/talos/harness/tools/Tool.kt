@@ -46,6 +46,8 @@ class ToolContext(
     val app: Context,
     /** Sandbox root: the agent's own directory inside the app. */
     val workspace: File,
+    /** Opt-in set by the interactive entry point, never from model arguments or stored text. */
+    val interactive: Boolean = false,
 )
 
 /** Tiny JSON Schema builder — enough for tool declarations, nothing more. */

@@ -220,3 +220,28 @@ So the complete agent — all 13 tools, no network, no API key — runs on this 
 Gemma also picked the right tool unprompted, which answers the separate open question of
 whether a general model (as opposed to FunctionGemma, the tool specialist) can drive the
 catalogue: at least on this task, it can.
+
+## Qwen3 0.6B no-thinking: first S24 Ultra run (2026-10-12)
+
+The official LiteRT Community bundle
+[`qwen3_0.6b_nothink_q4_block32_ekv1280.litertlm`](https://huggingface.co/litert-community/Qwen3-0.6B-int4)
+was downloaded at repository revision `6aa2daf8aba4aa456797fb8040b36a3948bcfda7`.
+Its size is 347,251,840 bytes and its published LFS SHA-256 is
+`2df6821ec12702dafd33915e7a1a1adc7c4b053f3672fd9555dfaf3a114c4139`; host and
+device checksums matched. It is Apache 2.0 and declares a 1280-token KV context.
+
+On the SM8650/Snapdragon 8 Gen 3, Android 16, Talos loaded the bundle and ran its
+fixed benchmark using CPU. The device showed 3.2 GB free RAM at that moment, below
+the app's 3.5 GB OpenCL headroom estimate. Measurement: **3.3 s to load, 790 ms to
+first token, 190 output characters in 3.1 s**. Talos displayed **42.8 tokens/s as
+an upper bound**, computed from the final KV token count divided by generation time;
+it is not a completion-only token rate. The fixed prompt asks the model to count
+from 1 to 500, with output capped at 96 tokens. No model was loaded beforehand, and
+the benchmark unloaded Qwen after it finished.
+
+This establishes that this artifact can load and generate through Talos on this
+phone. The displayed ceiling is numerically above the earlier Gemma 4 E2B CPU
+result of 35.5 tokens/s, but the short benchmark does not establish sustained chat
+speed, Portuguese quality, tool selection, or behavior near the 1280-token limit.
+The Qwen remains selected in local mode for the next chat; the benchmark left its
+engine unloaded, so a later turn will measure a fresh load again.
