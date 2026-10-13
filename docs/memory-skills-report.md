@@ -1,5 +1,9 @@
 # Memória, busca de conversas e skills — relatório de implementação
 
+Registro histórico do primeiro agente. A [segunda revisão](memory-skills-review.md)
+corrige a classificação declarado/inferido, o harness e a promoção de dados no
+prompt de subagentes; atualiza as medições e distingue testes host de build Android.
+
 Implementado no checkout Talos em 12/10/2026. Uma tentativa de
 `./gw :app:assembleDebug`: **BUILD SUCCESSFUL in 4s**. Onze verificações de lógica
 passaram no host com `python3 scripts/check-persistent-data.py`.

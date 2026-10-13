@@ -73,6 +73,7 @@ import com.talos.harness.local.formatDuration
 import com.talos.harness.local.formatTokensPerSecond
 import com.talos.harness.store.ConnectionDraft
 import com.talos.harness.store.MemoryEntry
+import com.talos.harness.store.MemoryKind
 import com.talos.harness.store.SkillEntry
 import com.talos.harness.store.ModelMode
 import com.talos.harness.store.ProviderCatalog
@@ -189,7 +190,7 @@ fun SettingsScreen(
     conversationTitles: Map<String, String>,
     onMemoryPolicy: suspend (Boolean, Boolean) -> Result<Unit>,
     onRefreshPersistentData: () -> Unit,
-    onSaveMemory: suspend (String?, String) -> Result<Unit>,
+    onSaveMemory: suspend (String?, String, MemoryKind) -> Result<Unit>,
     onDeleteMemory: suspend (String) -> Result<Unit>,
     onSaveSkill: suspend (String, String, String, String, Boolean) -> Result<Unit>,
     onDeleteSkill: suspend (String) -> Result<Unit>,

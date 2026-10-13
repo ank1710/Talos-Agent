@@ -16,6 +16,7 @@ internal data class TextRecord(
     val description: String,
     val body: String,
     val title: String = id,
+    val memoryKind: MemoryKind? = null,
 )
 
 internal class PlainTextStore(private val root: File, directory: String, private val bodyLimit: Int) {
@@ -33,7 +34,8 @@ internal class PlainTextStore(private val root: File, directory: String, private
         lock.withLock { readAll() }
     }
 
-    suspend fun save(id: String, description: String, body: String, origin: String, create: Boolean, title: String? = null): TextRecord =
+    suspend fun save(id: String, description: String, body: String, origin: String, create: Boolean, title: String? = null,
+                     memoryKind: MemoryKind? = null): TextRecord =
         withContext(Dispatchers.IO) {
             lock.withLock {
                 require(body.isNotBlank() && body.length <= bodyLimit) { "Texto deve ter de 1 a $bodyLimit caracteres." }
@@ -51,7 +53,7 @@ internal class PlainTextStore(private val root: File, directory: String, private
                 val displayName = title ?: previous?.title ?: id
                 require(displayName.isNotBlank() && displayName.length <= 80 && '\n' !in displayName && '\r' !in displayName) { "Nome deve ter até 80 caracteres em uma linha." }
                 val now = Instant.now().toString()
-                val record = TextRecord(id, previous?.created ?: now, now, origin, description.trim(), body.trim(), displayName.trim())
+                val record = TextRecord(id, previous?.created ?: now, now, origin, description.trim(), body.trim(), displayName.trim(), memoryKind)
                 // Atomic replacement prevents process death from leaving half a remembered fact.
                 val temporary = File(dir, "$id.tmp")
                 require(temporary.canonicalFile == File(dir.canonicalFile, "$id.tmp")) { "Caminho inválido." }
@@ -110,10 +112,12 @@ internal class PlainTextStore(private val root: File, directory: String, private
         require(origin.length <= 160 && description.length <= 160 && body.isNotBlank() && body.length <= bodyLimit) {
             "Conteúdo inválido: ${file.name}"
         }
-        return TextRecord(file.nameWithoutExtension, created, updated, origin, description, body, title)
+        val memoryKind = metadata["memory_kind"]?.let(MemoryKind::parse)
+        return TextRecord(file.nameWithoutExtension, created, updated, origin, description, body, title, memoryKind)
     }
 
     private fun encode(record: TextRecord): String =
         "created_at: ${record.created}\nupdated_at: ${record.updated}\norigin: ${record.origin}\n" +
-            "description: ${record.description.ifEmpty { "-" }}\ntitle: ${record.title}\n\n${record.body}\n"
+            "description: ${record.description.ifEmpty { "-" }}\ntitle: ${record.title}\n" +
+            (record.memoryKind?.let { "memory_kind: ${it.value}\n" } ?: "") + "\n${record.body}\n"
 }

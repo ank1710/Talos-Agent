@@ -16,6 +16,7 @@ import com.talos.harness.agent.MessageStatus
 import com.talos.harness.agent.Risk
 import com.talos.harness.agent.Role
 import com.talos.harness.agent.PersistentContext
+import com.talos.harness.store.MemoryKind
 import com.talos.harness.agent.SystemPrompt
 import com.talos.harness.agent.newId
 import com.talos.harness.gateway.GatewayApprovalClient
@@ -160,9 +161,7 @@ data class ChatUiState(
     val memoryDirectory: String = "",
     val skillsDirectory: String = "",
 ) {
-    val persistentToolsAvailable: Boolean get() = !onDevice ||
-        Regex("ekv(\\d+)", RegexOption.IGNORE_CASE).find(settings.model)?.groupValues?.get(1)?.toIntOrNull()
-            ?.let { it >= 4096 } ?: true
+    val persistentToolsAvailable: Boolean get() = !PersistentContext.useCompact(onDevice, settings.model)
 
     val skillExecutionUnavailable: String? get() = when {
         isRunning -> "Espere a tarefa atual terminar para executar uma skill."
@@ -252,41 +251,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val toolContext = ToolContext(app, workspace, interactive = true)
 
     /**
-     * The context window below which describing the whole tool catalogue is not
-     * affordable.
-     *
-     * Describing all 13 tools costs roughly 2190 tokens before the conversation
-     * starts (measured: a run died at 2184 against a 1024-token window), and the
-     * system prompt takes a few hundred more. 4096 leaves room for both plus a
-     * real exchange, so anything smaller gets the curated set instead.
-     */
-    private val FULL_TOOLSET_MIN_WINDOW = 4096
-
-    /**
-     * The context window a bundle declares, or null when it declares none.
-     *
-     * LiteRT-LM bundles carry no explicit context-length field - reading the
-     * header of the 2.4 GB Gemma shows the chat template and the
-     * `tf_lite_prefill_decode` section but no window size. The one signal that
-     * exists is the `ekv<N>` in the filename, which is how the small tool model is
-     * published (`mobile-actions_q8_ekv1024.litertlm`). It is worth trusting
-     * because it matches observation: that bundle failed at exactly 1024 tokens.
-     *
-     * null means "not declared", and the caller then assumes there IS room. That is
-     * the deliberate direction to fail in: a model that is too small says so
-     * loudly, with a token-count error naming both numbers, whereas a model that
-     * had room and was handed a crippled toolset just quietly underperforms - and
-     * the second mistake is invisible.
-     */
-    private fun declaredContextWindow(model: String): Int? =
-        Regex("""ekv(\d+)""", RegexOption.IGNORE_CASE)
-            .find(model)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.toIntOrNull()
-            ?.takeIf { it > 0 }
-
-    /**
      * The registry for the agent the user talks to (depth 0).
      *
      * It is built through [buildTools] rather than listed here, and a fresh one is
@@ -295,13 +259,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * built while a different provider was selected would send a subagent to the
      * wrong endpoint with the wrong key.
      */
-    private fun registryFor(backend: ChatBackend, settings: TalosSettings): ToolRegistry =
+    private fun registryFor(backend: ChatBackend, settings: TalosSettings, userMessage: String): ToolRegistry =
         buildTools(
             depth = 0,
             backend = backend,
             settings = settings,
             approvals = if (settings.usingDesktopBridge) gatewayGate else approvalGate,
             origin = "conversa: ${_state.value.conversation.id}",
+            userMessage = userMessage,
         )
 
     /**
@@ -324,6 +289,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         settings: TalosSettings,
         approvals: ApprovalGate,
         origin: String,
+        userMessage: String,
     ): ToolRegistry {
         // Which tools this run may describe to the model.
         //
@@ -347,8 +313,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // to match, and denying them tools they can hold makes the agent weaker for
         // no reason. Measured on device: the 2.4 GB Gemma loads and runs at 35 tok/s,
         // so "on-device" is not the same as "small".
-        val roomForEverything = !onDevice || declaredContextWindow(settings.model)
-            ?.let { it >= FULL_TOOLSET_MIN_WINDOW } ?: true
+        val roomForEverything = !PersistentContext.useCompact(onDevice, settings.model)
 
         val tools = mutableListOf<Tool>().apply {
             add(DeviceInfoTool())
@@ -369,7 +334,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // Network. CAUTION: an unattended run must not be able to POST
                 // your data anywhere without you opting that task in.
                 add(FetchUrlTool())
-                add(MemoryTool(memoryStore, origin))
+                add(MemoryTool(memoryStore, origin, userMessage))
                 add(SessionSearchTool(conversationStore))
                 add(SkillTool(skillStore, origin))
             }
@@ -385,7 +350,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // to skip a confirmation the user would have been asked for.
                 approvals = approvals,
                 toolContext = toolContext,
-                registryFactory = { next -> buildTools(next, backend, settings, approvals, origin) },
+                registryFactory = { next -> buildTools(next, backend, settings, approvals, origin, userMessage) },
                 apiKey = settings.effectiveApiKey,
                 baseUrl = settings.baseUrl,
                 model = settings.effectiveModel,
@@ -894,8 +859,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         finally { _state.update { it.copy(persistenceBusy = false) } }
     }
 
-    suspend fun saveMemory(id: String?, text: String): Result<Unit> = changePersistentData {
-        if (id == null) memoryStore.save(text, "usuário: ajustes") else memoryStore.edit(id, text)
+    suspend fun saveMemory(id: String?, text: String, kind: MemoryKind): Result<Unit> = changePersistentData {
+        if (id == null) memoryStore.save(text, "usuário: ajustes", kind) else memoryStore.edit(id, text, kind)
     }
     suspend fun deleteMemory(id: String): Result<Unit> = changePersistentData { memoryStore.forget(id) }
     suspend fun saveSkill(name: String, title: String, description: String, steps: String, create: Boolean): Result<Unit> = changePersistentData {
@@ -981,7 +946,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 client = turnBackend,
                 // Rebuilt per turn, so the subagent spawner in it captures the
                 // backend, model and credential that this turn is actually using.
-                registry = registryFor(turnBackend, settings),
+                registry = registryFor(turnBackend, settings, history.lastOrNull { it.role == Role.USER }?.content.orEmpty()),
                 // Against the desktop, prompts come from its policy rather than
                 // from this phone's allowlist, so the gateway gate answers them.
                 // [TalosSettings.usingDesktopBridge] is false on-device, so a local
@@ -1003,7 +968,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
 
-                val compact = local && (declaredContextWindow(settings.model)?.let { it < FULL_TOOLSET_MIN_WINDOW } ?: false)
+                val compact = PersistentContext.useCompact(local, settings.model)
                 val context = PersistentContext.build(
                     if (settings.includesMemory) memoryStore.list() else emptyList(), skillStore.list(),
                     history.lastOrNull { it.role == Role.USER }?.content.orEmpty(), compact,

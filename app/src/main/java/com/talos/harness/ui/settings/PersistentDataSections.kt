@@ -28,7 +28,7 @@ fun MemorySection(
     entries: List<MemoryEntry>, directory: String, busy: Boolean, error: String?, settings: TalosSettings,
     conversationTitles: Map<String, String>, onRefresh: () -> Unit,
     onPolicy: suspend (Boolean, Boolean) -> Result<Unit>,
-    onSave: suspend (String?, String) -> Result<Unit>, onDelete: suspend (String) -> Result<Unit>,
+    onSave: suspend (String?, String, MemoryKind) -> Result<Unit>, onDelete: suspend (String) -> Result<Unit>,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var editing by rememberSaveable { mutableStateOf<String?>(null) }
@@ -41,6 +41,8 @@ fun MemorySection(
     LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 24.dp)) {
         item {
             Text("${entries.size} memórias", style = MaterialTheme.typography.titleMedium)
+            Text("${entries.count { it.kind == MemoryKind.AGENT_INFERRED }} inferidas: revise antes de tratá-las como fatos seus. Entradas antigas sem classificação são consideradas inferidas.",
+                style = MaterialTheme.typography.bodySmall)
             ToggleRow("Usar memória nas conversas", "Inclui resumos automaticamente nos próximos pedidos. Desativar não apaga os fatos.",
                 settings.memoryEnabled, !policyBusy) { enabled ->
                 policyBusy = true
@@ -72,6 +74,8 @@ fun MemorySection(
         }
         if (filtered.isEmpty()) item { Text(if (entries.isEmpty()) "Nenhuma memória carregada." else "Nenhuma memória encontrada.") }
         items(filtered, key = { it.id }) { entry ->
+            Text(entry.kind.label, style = MaterialTheme.typography.labelLarge,
+                color = if (entry.kind == MemoryKind.AGENT_INFERRED) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary)
             Text(entry.text)
             Metadata(entry.createdAt, entry.updatedAt, originLabel(entry.origin, conversationTitles))
             Row {
@@ -83,8 +87,8 @@ fun MemorySection(
     }
     editing?.let { id ->
         val entry = entries.firstOrNull { it.id == id }
-        key(id) { MemoryEditor(entry, busy, { editing = null }) { text ->
-            onSave(id.takeIf { it.isNotEmpty() }, text).onSuccess { notice = "Memória salva." }
+        key(id) { MemoryEditor(entry, busy, { editing = null }) { text, kind ->
+            onSave(id.takeIf { it.isNotEmpty() }, text, kind).onSuccess { notice = "Memória salva." }
         } }
     }
     deleting?.let { id -> DeleteDialog("Apagar esta memória?", busy, { deleting = null }) {
@@ -142,10 +146,21 @@ fun SkillsSection(
 }
 
 @Composable
-private fun MemoryEditor(entry: MemoryEntry?, busy: Boolean, onClose: () -> Unit, onSave: suspend (String) -> Result<Unit>) {
+private fun MemoryEditor(entry: MemoryEntry?, busy: Boolean, onClose: () -> Unit, onSave: suspend (String, MemoryKind) -> Result<Unit>) {
     var text by rememberSaveable { mutableStateOf(entry?.text.orEmpty()) }
-    DocumentEditor(if (entry == null) "Adicionar memória" else "Memória", text != entry?.text.orEmpty(), busy,
-        text.isNotBlank() && text.length <= MemoryStore.MAX_TEXT, onClose, { onSave(text) }) { locked ->
+    // A manual addition is a human statement; editing an inference alone must not promote it.
+    val initialKind = entry?.kind ?: MemoryKind.USER_DECLARED
+    var kindValue by rememberSaveable { mutableStateOf(initialKind.value) }
+    val kind = MemoryKind.parse(kindValue)
+    DocumentEditor(if (entry == null) "Adicionar memória" else "Memória", text != entry?.text.orEmpty() || kind != initialKind, busy,
+        text.isNotBlank() && text.length <= MemoryStore.MAX_TEXT, onClose, { onSave(text, kind) }) { locked ->
+        Text("Classificação", style = MaterialTheme.typography.titleSmall)
+        MemoryKind.entries.forEach { option ->
+            FilterChip(selected = kind == option, onClick = { kindValue = option.value }, enabled = !locked,
+                label = { Text(option.label) })
+        }
+        Text(if (kind == MemoryKind.AGENT_INFERRED) "Interpretação do agente, ainda não confirmada por você."
+            else "Use apenas para algo que você afirmou ou confirma agora.", style = MaterialTheme.typography.bodySmall)
         OutlinedTextField(value = text, onValueChange = { text = it }, readOnly = locked,
             label = { Text("Fato ou preferência") }, supportingText = { Text("${text.length}/${MemoryStore.MAX_TEXT}") },
             isError = text.length > MemoryStore.MAX_TEXT, modifier = Modifier.fillMaxWidth(), minLines = 5)

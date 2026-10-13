@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Host logic checks against classes from assembleDebug; never invokes Gradle or Android."""
 import os
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
 import sys
 import zipfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--source-check", action="store_true", help="Compile current non-UI sources against cached app dependencies")
+parser.add_argument("--suite", action="append", choices=["persistent", "settings", "markdown", "catalog"],
+                    help="Run only the named suite(s); default runs all")
+options = parser.parse_args()
 
 repo = Path(__file__).resolve().parents[1]
 cache = Path(os.environ.get("TALOS_GRADLE_CACHE", repo.parent / ".gradle-home/caches/modules-2/files-2.1"))
@@ -51,19 +58,26 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
         extras.append(str(output))
     cp = os.pathsep.join([str(classes)] + libs + extras)
     sources = []
-    if "--source-check" in sys.argv:
+    if options.source_check:
         # Check the changed non-UI logic before the one requested APK build.
         base = repo / "app/src/main/java/com/talos/harness"
         sources = [str(base / name) for name in [
             "store/Settings.kt", "store/ConnectionSettings.kt", "store/PlainTextStore.kt",
             "store/MemoryStore.kt", "store/SkillStore.kt", "tools/SkillTool.kt", "tools/StoredData.kt",
+            "tools/MemoryTool.kt", "tools/SessionSearchTool.kt", "tools/SubagentTool.kt", "agent/SystemPrompt.kt",
             "agent/PersistentContext.kt", "llm/DeepSeekClient.kt",
             "ui/markdown/OrderedListLine.kt", "local/HuggingFaceModelCatalog.kt",
         ]]
     subprocess.run([str(java), "-cp", os.pathsep.join(compiler), "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler",
                     "-no-stdlib", "-no-reflect", "-jvm-target", "17", "-classpath", cp,
+                    # Tests may inspect internals without widening the app's public API.
+                    "-Xfriend-paths=" + str(classes),
                     "-d", str(target)] + [str(p) for p in sorted((repo / "tests/host").glob("*.kt"))] + sources, check=True)
-    for suite in ["PersistentDataChecksKt", "SettingsChecksKt", "MarkdownChecksKt", "ModelCatalogChecksKt"]:
+    suites = {"persistent": "PersistentDataChecksKt", "settings": "SettingsChecksKt",
+              "markdown": "MarkdownChecksKt", "catalog": "ModelCatalogChecksKt"}
+    print("MODE: current non-UI sources + cached app dependencies" if options.source_check else "MODE: cached assembleDebug classes", flush=True)
+    for selected in options.suite or suites:
+        suite = suites[selected]
         result = subprocess.run([str(java), "-cp", os.pathsep.join([str(target), cp]), suite],
                                 text=True, capture_output=True)
         print(result.stdout, end="")

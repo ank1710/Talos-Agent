@@ -230,6 +230,14 @@ workspace. The skill filename is its name; headers record creation, last edit an
 origin, followed by a blank line and the text. Keep the header format when editing
 files externally, then press **Atualizar**. Regular user editing needs only the UI.
 
+Memory headers also record `memory_kind: user_declared` or `agent_inferred`.
+Missing classification in older files is treated as inferred without rewriting
+the file. The `memory/save` argument `kind` defaults to inferred; declaring a user
+statement requires a literal excerpt from the current human message. Settings
+shows and edits the classification, and prompt summaries retain it. Literal
+matching does not distinguish a user's assertion from quoted third-party text;
+the classification remains reviewable.
+
 The full interactive catalogue includes `memory` (`save`, `forget`, `list`),
 `session_search` (literal search, optional date range, paginated excerpts) and
 `skill` (`create`, `list`, `execute`, `edit`, `delete`). All three are CAUTION and
@@ -241,6 +249,13 @@ available offline regardless of the model.
 See [the implementation and security report](docs/memory-skills-report.md) for
 file-by-file changes, context budgets, test evidence and the remaining limitation:
 an opted-in scheduled `shell` still has the app's filesystem authority.
+See [the second review](docs/memory-skills-review.md) for the provenance correction,
+subagent trust boundary, 19 host checks, and the blocked build. When the APK cannot
+be rebuilt in the sandbox, `python3 scripts/check-persistent-data.py --source-check
+--suite persistent --suite markdown --suite catalog` checks current non-UI sources
+against cached app dependencies. This is not an APK or Compose compilation. The
+default command still runs every suite after a build; the Settings network check
+requires permission to bind a localhost HTTP server.
 
 See [the Settings and local-model follow-up](docs/settings-followup-and-local-model.md)
 for connection safety, validation status and the tested-device model shortlist.
