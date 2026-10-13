@@ -59,6 +59,8 @@ data class TalosSettings(
     val localModel: String = "",
     val memoryEnabled: Boolean = true,
     val memoryInRemote: Boolean = true,
+    /** Empty means no app is authorized to expose its screen to the agent. */
+    val screenReadAllowedPackages: Set<String> = emptySet(),
 ) {
     /** Provider behavior is derived from the persisted id, with safe legacy fallback. */
     val provider: Provider get() = ProviderCatalog.byId(providerId) ?: ProviderCatalog.CUSTOM
@@ -177,6 +179,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val memoryInRemote = booleanPreferencesKey("memory_in_remote")
         val localModel = stringPreferencesKey("local_model")
         val cloudProvider = stringPreferencesKey("last_cloud_provider")
+        val screenReadAllowedPackages = stringSetPreferencesKey("screen_read_allowed_packages")
     }
 
     private fun profileUrl(id: String) = stringPreferencesKey("profile_url_$id")
@@ -217,6 +220,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             autoApprovedTools = prefs[Keys.autoApprovedTools] ?: emptySet(), credentials = keys, profiles = profiles,
             localModel = prefs[Keys.localModel] ?: if (mode == ModelMode.ON_DEVICE) prefs[Keys.model].orEmpty() else "",
             memoryEnabled = prefs[Keys.memoryEnabled] ?: true, memoryInRemote = prefs[Keys.memoryInRemote] ?: true,
+            screenReadAllowedPackages = prefs[Keys.screenReadAllowedPackages] ?: emptySet(),
         )
     }
 
@@ -286,6 +290,11 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
     suspend fun setMemoryPolicy(enabled: Boolean, remote: Boolean) = dataStore.edit {
         it[Keys.memoryEnabled] = enabled
         it[Keys.memoryInRemote] = remote
+    }
+
+    suspend fun setScreenReadAllowedPackages(packages: Set<String>) = dataStore.edit { prefs ->
+        // Only syntactically valid package ids are persisted; an empty set fails closed.
+        prefs[Keys.screenReadAllowedPackages] = packages.filter { it.matches(Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")) }.toSet()
     }
 
     suspend fun setTemperature(value: Double) = dataStore.edit {

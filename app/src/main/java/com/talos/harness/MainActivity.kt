@@ -201,6 +201,7 @@ private fun TalosRoot(
             onTestConnection = viewModel::testConnection,
             onRevokeApproval = viewModel::revokeApproval,
             onClearApprovals = viewModel::clearApprovals,
+            onScreenReadAllowedPackagesChange = viewModel::setScreenReadAllowedPackages,
             onBack = { showSettings = false },
             memories = state.memories,
             skills = state.skills,

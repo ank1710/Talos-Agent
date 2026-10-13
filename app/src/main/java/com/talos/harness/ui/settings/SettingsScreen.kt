@@ -2,6 +2,7 @@ package com.talos.harness.ui.settings
 
 import androidx.activity.compose.BackHandler
 import android.content.Intent
+import android.provider.Settings as AndroidSettings
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -27,6 +28,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -45,6 +47,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,6 +64,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.talos.harness.accessibility.ScreenReadService
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.talos.harness.local.BenchmarkOutcome
@@ -81,6 +88,7 @@ import com.talos.harness.store.ProviderModel
 import com.talos.harness.store.TalosSettings
 import com.talos.harness.ui.LocalModelDownloadStatus
 import com.talos.harness.ui.theme.TalosColors
+import kotlinx.coroutines.delay
 import java.util.Locale
 
 /**
@@ -101,6 +109,7 @@ private enum class SettingsSection(val title: String) {
     MEMORY("Memória"),
     SKILLS("Skills"),
     DIAGNOSTICS("Diagnóstico"),
+    ACCESSIBILITY("Acessibilidade"),
 }
 
 /**
@@ -178,6 +187,7 @@ fun SettingsScreen(
     onTestConnection: () -> Unit,
     onRevokeApproval: (String) -> Unit,
     onClearApprovals: () -> Unit,
+    onScreenReadAllowedPackagesChange: (Set<String>) -> Unit,
     onBack: () -> Unit,
     memories: List<MemoryEntry>,
     skills: List<SkillEntry>,
@@ -198,13 +208,28 @@ fun SettingsScreen(
     modifier: Modifier = Modifier,
 ) {
     val palette = TalosColors.current
-
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var accessibilityActive by remember { mutableStateOf(ScreenReadService.isActive()) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) accessibilityActive = ScreenReadService.isActive()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     // rememberSaveable, not remember: a rotation or a process-death restore while
     // editing the API key should not bounce the user back to the root list and
     // make them hunt for the section again.
     var sectionName by rememberSaveable { mutableStateOf(SettingsSection.ROOT.name) }
     val section = SettingsSection.entries.firstOrNull { it.name == sectionName }
         ?: SettingsSection.ROOT
+    LaunchedEffect(section) {
+        if (section == SettingsSection.ACCESSIBILITY) while (true) {
+            accessibilityActive = ScreenReadService.isActive()
+            delay(750)
+        }
+    }
     // The system back gesture must walk sub-menu -> root before it leaves Settings;
     // without this the user would jump straight out of a section into the chat.
     var connectionDirty by remember { mutableStateOf(false) }
@@ -255,6 +280,7 @@ fun SettingsScreen(
             when (section) {
                 SettingsSection.ROOT -> RootSection(
                     settings = settings,
+                    accessibilityActive = accessibilityActive,
                     isBusy = isBusy,
                     statusMessage = statusMessage,
                     deviceRecommendation = deviceRecommendation,
@@ -342,6 +368,12 @@ fun SettingsScreen(
                     onFetchModels = onFetchModels,
                     onTestConnection = onTestConnection,
                 )
+                SettingsSection.ACCESSIBILITY -> AccessibilitySection(
+                    allowedPackages = settings.screenReadAllowedPackages,
+                    serviceActive = accessibilityActive,
+                    onPackagesChanged = onScreenReadAllowedPackagesChange,
+                    onOpenSystemSettings = { context.startActivity(Intent(AndroidSettings.ACTION_ACCESSIBILITY_SETTINGS)) },
+                )
             }
             Spacer(modifier = Modifier.height(32.dp))
         }
@@ -352,6 +384,47 @@ fun SettingsScreen(
 // Root menu
 // ---------------------------------------------------------------------------
 
+@Composable
+private fun AccessibilitySection(
+    allowedPackages: Set<String>,
+    serviceActive: Boolean,
+    onPackagesChanged: (Set<String>) -> Unit,
+    onOpenSystemSettings: () -> Unit,
+) {
+    val context = LocalContext.current
+    val apps = remember {
+        @Suppress("DEPRECATION")
+        context.packageManager.getInstalledApplications(0)
+            .filter { it.packageName != context.packageName }
+            .map { info -> info.packageName to context.packageManager.getApplicationLabel(info).toString() }
+            .sortedBy { it.second.lowercase(Locale.ROOT) }
+    }
+    Text("Acessibilidade · leitura somente", style = MaterialTheme.typography.titleMedium)
+    Text(if (serviceActive) "Estado: ATIVA — o serviço está ligado." else "Estado: DESLIGADA — o serviço não está ligado.", fontWeight = FontWeight.Bold)
+    Text("Enquanto ligada, o Talos enxerga o conteúdo de tudo que aparece na tela dos apps autorizados abaixo. Quando você usa screen_read, esse texto é enviado ao modelo da conversa. O Talos não clica, digita, rola nem executa gestos.")
+    Text("Sem apps selecionados, nenhuma tela pode ser lida.")
+    OutlinedButton(onClick = onOpenSystemSettings) { Text("Abrir configurações de acessibilidade do Android") }
+    Text("Para desligar o serviço, desative “Leitura de tela do Talos” nessa tela do Android. Só o sistema pode ligar ou desligar este serviço.")
+    Text("Android 13 ou mais recente: como o Talos foi instalado fora da loja, talvez seja preciso abrir as informações do app, tocar no menu ⋮ e escolher “Permitir configurações restritas” antes de ativar a acessibilidade.")
+    Text("Este app não pode ser publicado na Google Play Store com esta funcionalidade.", color = TalosColors.current.caution, fontWeight = FontWeight.Bold)
+    SectionHeader("Apps autorizados")
+    if (apps.isEmpty()) Text("Nenhum app instalado foi encontrado.")
+    apps.forEach { (packageName, label) ->
+        Row(Modifier.fillMaxWidth().clickable {
+            val next = if (packageName in allowedPackages) allowedPackages - packageName else allowedPackages + packageName
+            onPackagesChanged(next)
+        }.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(checked = packageName in allowedPackages, onCheckedChange = { checked ->
+                onPackagesChanged(if (checked) allowedPackages + packageName else allowedPackages - packageName)
+            })
+            Column {
+                Text(label)
+                Text(packageName, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
 /**
  * The root list: one row per sub-menu, each with the live value as its summary.
  *
@@ -361,6 +434,7 @@ fun SettingsScreen(
 @Composable
 private fun RootSection(
     settings: TalosSettings,
+    accessibilityActive: Boolean,
     isBusy: Boolean,
     statusMessage: String?,
     deviceRecommendation: ModelRecommendation?,
@@ -404,6 +478,11 @@ private fun RootSection(
         onClick = { onOpen(SettingsSection.SKILLS) },
     )
     SectionHeader("Segurança e diagnóstico")
+    SettingsMenuRow(
+        title = SettingsSection.ACCESSIBILITY.title,
+        summary = if (accessibilityActive) "Leitura de tela ativa · ${settings.screenReadAllowedPackages.size} apps autorizados" else "Leitura de tela desligada · ${settings.screenReadAllowedPackages.size} apps autorizados",
+        onClick = { onOpen(SettingsSection.ACCESSIBILITY) },
+    )
     SettingsMenuRow(
         title = SettingsSection.APPROVALS.title,
         summary = approvalsSummary(settings),

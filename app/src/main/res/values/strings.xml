@@ -1,3 +1,5 @@
 <resources>
+    <string name="accessibility_service_name">Leitura de tela do Talos</string>
+    <string name="accessibility_service_description">Enquanto ativado, o Talos pode enxergar o texto e os elementos visíveis da tela apenas nos apps que você autorizou em Ajustes. O conteúdo é enviado ao modelo da conversa quando você usa a ferramenta de leitura.</string>
     <string name="app_name">Talos</string>
 </resources>

@@ -10,7 +10,7 @@ import zipfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--source-check", action="store_true", help="Compile current non-UI sources against cached app dependencies")
-parser.add_argument("--suite", action="append", choices=["persistent", "settings", "markdown", "catalog", "approval_stream"],
+parser.add_argument("--suite", action="append", choices=["persistent", "settings", "markdown", "catalog", "approval_stream", "accessibility"],
                     help="Run only the named suite(s); default runs all")
 options = parser.parse_args()
 
@@ -18,6 +18,38 @@ repo = Path(__file__).resolve().parents[1]
 cache = Path(os.environ.get("TALOS_GRADLE_CACHE", repo.parent / ".gradle-home/caches/modules-2/files-2.1"))
 classes = repo / "app/build/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes"
 java = Path(os.environ.get("JAVA_HOME", "/opt/homebrew/opt/openjdk@21")) / "bin/java"
+suite_names = ["persistent", "settings", "markdown", "catalog", "approval_stream", "accessibility"]
+selected_suites = options.suite or suite_names
+
+def check_accessibility_sources():
+    service = (repo / "app/src/main/java/com/talos/harness/accessibility/ScreenReadService.kt").read_text()
+    tool = (repo / "app/src/main/java/com/talos/harness/tools/ScreenReadTool.kt").read_text()
+    manifest = (repo / "app/src/main/AndroidManifest.xml").read_text()
+    worker = (repo / "app/src/main/java/com/talos/harness/schedule/ScheduledAgentWorker.kt").read_text()
+    registry = (repo / "app/src/main/java/com/talos/harness/ui/ChatViewModel.kt").read_text()
+    persist_body = registry.split("private fun persist(conversation: Conversation)", 1)[1].split("\n    private fun deriveTitle", 1)[0]
+    assert 'override val risk = Risk.CAUTION' in tool
+    assert '"screen_read"' not in worker
+    assert 'requireInteractive(ctx)' in tool and 'allowed.isEmpty()' in tool
+    assert 'packageName !in allowedPackages' in service and service.index('packageName !in allowedPackages') < service.index('val rows = mutableListOf')
+    assert 'return storedData(buildJsonObject' in tool and 'put("nodes", JsonArray' in tool
+    assert 'android:exported="true"' in manifest and 'android.permission.BIND_ACCESSIBILITY_SERVICE' in manifest
+    assert 'add(ScreenReadTool(SettingsRepository(appContext)))' in registry
+    assert 'screenReadEphemeralConversations += _state.value.conversation.id' in registry
+    assert 'if (snapshot.id in screenReadEphemeralConversations) return@launch' in persist_body
+    print("PASS screen_read is CAUTION")
+    print("PASS screen_read excluded from scheduled allowlists and requires interactive context")
+    print("PASS unauthorized package is rejected before node traversal")
+    print("PASS screen_read output uses the untrusted storedData envelope")
+    print("PASS exported accessibility service is bound by system permission")
+    print("PASS screen_read is registered only in the interactive registry")
+    print("PASS conversations containing screen output are not persisted")
+
+if "accessibility" in selected_suites:
+    check_accessibility_sources()
+if selected_suites == ["accessibility"]:
+    print("MODE: accessibility source invariants (no Android runtime)")
+    raise SystemExit(0)
 
 def jar(group, artifact, version):
     matches = list((cache / group / artifact / version).glob("*/*.jar"))
@@ -76,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
                     "-d", str(target)] + [str(p) for p in sorted((repo / "tests/host").glob("*.kt"))] + sources, check=True)
     suites = {"persistent": "PersistentDataChecksKt", "settings": "SettingsChecksKt",
               "markdown": "MarkdownChecksKt", "catalog": "ModelCatalogChecksKt",
-              "approval_stream": "ApprovalStreamChecksKt"}
+              "approval_stream": "ApprovalStreamChecksKt", "accessibility": None}
     approval_source = (repo / "app/src/main/java/com/talos/harness/ui/ChatViewModel.kt").read_text()
     resolve_source = approval_source.split("fun resolveApproval(", 1)[1].split("\n    /**", 1)[0]
     post_source = approval_source.split("private suspend fun postDecision(", 1)[1].split("\n    fun dismissError", 1)[0]
@@ -98,7 +130,9 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
     print("PASS OkHttp stream cancellation and idle timeout source invariant")
     print("PASS shell private-data approval warning source invariant")
     print("MODE: current non-UI sources + cached app dependencies" if options.source_check else "MODE: cached assembleDebug classes", flush=True)
-    for selected in options.suite or suites:
+    for selected in selected_suites:
+        if suites[selected] is None:
+            continue
         suite = suites[selected]
         result = subprocess.run([str(java), "-cp", os.pathsep.join([str(target), cp]), suite],
                                 text=True, capture_output=True)

@@ -67,6 +67,7 @@ import com.talos.harness.tools.ListDirTool
 import com.talos.harness.tools.MemoryTool
 import com.talos.harness.tools.SkillTool
 import com.talos.harness.tools.SessionSearchTool
+import com.talos.harness.tools.ScreenReadTool
 import com.talos.harness.tools.NotifyTool
 import com.talos.harness.tools.OpenUrlTool
 import com.talos.harness.tools.ReadFileTool
@@ -331,6 +332,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 add(ListAppsTool())
                 add(CalendarReadTool())
                 add(ContactsSearchTool())
+                add(ScreenReadTool(SettingsRepository(appContext)))
                 // Network. CAUTION: an unattended run must not be able to POST
                 // your data anywhere without you opting that task in.
                 add(FetchUrlTool())
@@ -370,6 +372,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var localModelSearchJob: Job? = null
     private var localModelDownloadJob: Job? = null
     private var approvalDeferred: CompletableDeferred<ApprovalDecision>? = null
+    // Screen output must stay session-only because ordinary conversation persistence stores tool results.
+    private val screenReadEphemeralConversations = mutableSetOf<String>()
 
     private data class ActiveGatewayRun(
         val runId: String,
@@ -901,6 +905,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         return true
     }
 
+    fun setScreenReadAllowedPackages(packages: Set<String>) {
+        viewModelScope.launch { settingsRepo.setScreenReadAllowedPackages(packages) }
+    }
+
     // --------------------------------------------------------- scheduled tasks
 
     /**
@@ -1091,6 +1099,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
             is AgentEvent.ToolFinished -> {
                 upsert(event.message)
+                if (event.message.toolName == "screen_read") {
+                    // The screen text lives in the live transcript for this session, never in conversation files.
+                    screenReadEphemeralConversations += _state.value.conversation.id
+                }
                 if (event.message.toolName in setOf("memory", "skill", "spawn_subagent")) refreshPersistentData()
             }
 
@@ -1179,8 +1191,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun persist(conversation: Conversation) {
+        if (conversation.id in screenReadEphemeralConversations) return
         val snapshot = conversation.copy(updatedAt = System.currentTimeMillis())
         viewModelScope.launch {
+            if (snapshot.id in screenReadEphemeralConversations) return@launch
             conversationStore.save(snapshot)
             _state.update { it.copy(conversations = conversationStore.list()) }
         }
