@@ -124,6 +124,7 @@ fun ChatScreen(
     onAttach: (Attachment) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onVoiceInput: () -> Unit,
+    onToggleConversation: () -> Unit,
     onStopVoice: () -> Unit,
     onVoiceDraftConsumed: () -> Unit,
     onToggleSpeak: () -> Unit,
@@ -339,6 +340,8 @@ fun ChatScreen(
                     visionWarning = state.draftAttachments.isNotEmpty() && !state.supportsVision,
                     isListening = state.isListening,
                     voiceAvailable = state.voiceAvailable,
+                    conversationMode = state.conversationMode,
+                    onToggleConversation = onToggleConversation,
                     onVoiceInput = onVoiceInput,
                     onStopVoice = onStopVoice,
                     onPickGallery = {
@@ -680,6 +683,8 @@ private fun InputBar(
     visionWarning: Boolean,
     isListening: Boolean,
     voiceAvailable: Boolean,
+    conversationMode: Boolean,
+    onToggleConversation: () -> Unit,
     onVoiceInput: () -> Unit,
     onStopVoice: () -> Unit,
     onPickGallery: () -> Unit,
@@ -721,6 +726,31 @@ private fun InputBar(
                     color = palette.caution,
                     modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp),
                 )
+            }
+
+            // Hands-free conversation lives on its own line above the field rather
+            // than beside it. Inline it stole width from the text box, which is the
+            // thing being typed into -- the control for talking must not shrink the
+            // control for writing. A word, not an icon: no core icon says "keep
+            // listening after answering".
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, top = 8.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(
+                    onClick = onToggleConversation,
+                    enabled = enabled && voiceAvailable,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        text = if (conversationMode) "Conversa •" else "Conversa",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (conversationMode) palette.brand else palette.textSecondary,
+                    )
+                }
             }
 
             Row(

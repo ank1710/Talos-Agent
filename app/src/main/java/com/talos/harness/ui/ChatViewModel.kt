@@ -121,6 +121,14 @@ data class ChatUiState(
     val isSpeaking: Boolean = false,
     /** When on, finished assistant turns are read aloud. Off by default. */
     val speakReplies: Boolean = false,
+    /**
+     * Hands-free conversation: listen, answer aloud, then listen again, with no taps.
+     *
+     * Distinct from [speakReplies], which only reads answers out. Turning this on
+     * also implies speaking, because a conversation the user cannot hear is not a
+     * conversation.
+     */
+    val conversationMode: Boolean = false,
     val voiceAvailable: Boolean = true,
     /** Unattended tasks, mirrored from disk so the UI never reads files itself. */
     val scheduledTasks: List<ScheduledTask> = emptyList(),
@@ -462,6 +470,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 delay(VOICE_POLL_MS)
             }
+        }
+
+        // The turn-taking loop: the moment Talos stops talking, listen again.
+        //
+        // Reopening on this signal rather than on a timer is the whole trick. The
+        // recogniser and the speaker contend for the same audio path, so a mic
+        // opened too early transcribes Talos' own voice and the agent answers
+        // itself. Only the engine knows when it is really done.
+        voice.onSpeakFinished = {
+            if (_state.value.conversationMode) startVoiceInput()
         }
     }
 
@@ -828,7 +846,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             onPartial = { partial ->
                 if (partial.isNotBlank()) _state.update { it.copy(voiceDraft = partial) }
             },
-            onFinal = { transcript -> _state.update { it.copy(voiceDraft = transcript) } },
+            onFinal = { transcript ->
+                // In conversation mode the transcript is the turn: sending it is the
+                // whole point of hands-free. Outside it, the text goes to the composer
+                // so the user can read what was heard before the agent acts on it --
+                // recognition mishears, and acting on a misheard command is worse than
+                // an extra tap.
+                val handsFree = _state.value.conversationMode && transcript.isNotBlank()
+                if (handsFree) {
+                    _state.update { it.copy(voiceDraft = null) }
+                    send(transcript)
+                } else {
+                    _state.update { it.copy(voiceDraft = transcript) }
+                }
+            },
             onError = { message -> _state.update { it.copy(error = message) } },
         )
     }
@@ -836,6 +867,37 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun stopVoiceInput() = voice.stopListening()
 
     fun consumeVoiceDraft() = _state.update { it.copy(voiceDraft = null) }
+
+    /**
+     * Turns hands-free conversation on or off.
+     *
+     * Switching on also switches speaking on, and opens the microphone immediately:
+     * leaving it on with a closed mic would look like it is listening while silently
+     * doing nothing. Switching off stops both, so the app never keeps the microphone
+     * after the user asked it to stop.
+     */
+    fun toggleConversationMode() {
+        val next = !_state.value.conversationMode
+        _state.update { it.copy(conversationMode = next, speakReplies = next || it.speakReplies) }
+        if (next) {
+            startVoiceInput()
+        } else {
+            voice.stopListening()
+            voice.stopSpeaking()
+        }
+    }
+
+    /**
+     * Stops the answer and reopens the microphone at once, for interrupting by tap.
+     *
+     * Barge-in by voice is not offered: the recogniser would hear the very audio it
+     * is trying to interrupt, so the honest version of interruption is a deliberate
+     * tap rather than a button that appears to listen while Talos talks.
+     */
+    fun interruptAndListen() {
+        voice.stopSpeaking()
+        if (_state.value.conversationMode) startVoiceInput()
+    }
 
     fun toggleSpeakReplies() {
         val next = !_state.value.speakReplies
@@ -1009,6 +1071,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     activeRunToken = null
                     _state.update { it.copy(isRunning = false) }
                     persist(_state.value.conversation)
+
+                    // Hands-free safety net. The loop normally reopens the microphone
+                    // when the answer finishes being spoken, but a turn can end with
+                    // nothing to say -- an empty reply, a tool-only turn, a failure --
+                    // and then that signal never fires and the conversation silently
+                    // stalls with the mic shut. Reopen here too.
+                    //
+                    // Guarded on both flags because either path may win the race: if
+                    // the utterance is still playing we leave it to onSpeakFinished,
+                    // and if the mic is already open there is nothing to do. Without
+                    // the guard the two paths would start two recognition sessions.
+                    if (_state.value.conversationMode && !voice.isSpeaking && !voice.isListening) {
+                        startVoiceInput()
+                    }
                 }
             }
         }

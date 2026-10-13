@@ -242,6 +242,7 @@ private fun TalosRoot(
             onAttach = viewModel::addAttachment,
             onRemoveAttachment = viewModel::removeAttachment,
             onVoiceInput = requestVoiceInput,
+            onToggleConversation = viewModel::toggleConversationMode,
             onStopVoice = viewModel::stopVoiceInput,
             onVoiceDraftConsumed = viewModel::consumeVoiceDraft,
             onToggleSpeak = viewModel::toggleSpeakReplies,
