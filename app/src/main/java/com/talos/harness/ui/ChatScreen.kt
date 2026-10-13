@@ -728,6 +728,31 @@ private fun InputBar(
                 )
             }
 
+            // Hands-free conversation lives on its own line above the field rather
+            // than beside it. Inline it stole width from the text box, which is the
+            // thing being typed into -- the control for talking must not shrink the
+            // control for writing. A word, not an icon: no core icon says "keep
+            // listening after answering".
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, top = 8.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(
+                    onClick = onToggleConversation,
+                    enabled = enabled && voiceAvailable,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        text = if (conversationMode) "Conversa •" else "Conversa",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (conversationMode) palette.brand else palette.textSecondary,
+                    )
+                }
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -746,20 +771,6 @@ private fun InputBar(
                             tint = if (isListening) palette.brand else palette.textSecondary,
                         )
                     }
-                }
-                // Hands-free conversation. A labelled button rather than an icon
-                // because no core icon says "keep listening after answering", and a
-                // glyph the user has to guess at would be worse than a word.
-                TextButton(
-                    onClick = onToggleConversation,
-                    enabled = enabled && voiceAvailable,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                ) {
-                    Text(
-                        text = if (conversationMode) "Conversa •" else "Conversa",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = if (conversationMode) palette.brand else palette.textSecondary,
-                    )
                 }
                 Box {
                     IconButton(onClick = { attachMenuOpen = true }, enabled = enabled) {
