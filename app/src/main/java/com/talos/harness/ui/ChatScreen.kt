@@ -124,6 +124,7 @@ fun ChatScreen(
     onAttach: (Attachment) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onVoiceInput: () -> Unit,
+    onToggleConversation: () -> Unit,
     onStopVoice: () -> Unit,
     onVoiceDraftConsumed: () -> Unit,
     onToggleSpeak: () -> Unit,
@@ -339,6 +340,8 @@ fun ChatScreen(
                     visionWarning = state.draftAttachments.isNotEmpty() && !state.supportsVision,
                     isListening = state.isListening,
                     voiceAvailable = state.voiceAvailable,
+                    conversationMode = state.conversationMode,
+                    onToggleConversation = onToggleConversation,
                     onVoiceInput = onVoiceInput,
                     onStopVoice = onStopVoice,
                     onPickGallery = {
@@ -680,6 +683,8 @@ private fun InputBar(
     visionWarning: Boolean,
     isListening: Boolean,
     voiceAvailable: Boolean,
+    conversationMode: Boolean,
+    onToggleConversation: () -> Unit,
     onVoiceInput: () -> Unit,
     onStopVoice: () -> Unit,
     onPickGallery: () -> Unit,
@@ -741,6 +746,20 @@ private fun InputBar(
                             tint = if (isListening) palette.brand else palette.textSecondary,
                         )
                     }
+                }
+                // Hands-free conversation. A labelled button rather than an icon
+                // because no core icon says "keep listening after answering", and a
+                // glyph the user has to guess at would be worse than a word.
+                TextButton(
+                    onClick = onToggleConversation,
+                    enabled = enabled && voiceAvailable,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        text = if (conversationMode) "Conversa •" else "Conversa",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = if (conversationMode) palette.brand else palette.textSecondary,
+                    )
                 }
                 Box {
                     IconButton(onClick = { attachMenuOpen = true }, enabled = enabled) {

@@ -354,6 +354,26 @@ class VoiceController(private val context: Context) {
         }
     }
 
+    /**
+     * Fired on the main thread when an utterance of ours ends, whether it finished
+     * or failed.
+     *
+     * This is what makes hands-free conversation possible: the recogniser and the
+     * speaker cannot both be open at once, so the only safe moment to reopen the
+     * microphone is after the engine reports that it stopped talking. Driving the
+     * loop on a timer instead would reopen the mic while Talos is still speaking
+     * and transcribe its own voice.
+     *
+     * Deliberately a single callback rather than a listener list: only the chat
+     * turn drives this loop, and a second subscriber would fight it.
+     */
+    var onSpeakFinished: (() -> Unit)? = null
+
+    private fun notifySpeakFinished() {
+        val callback = onSpeakFinished ?: return
+        runOnMain { callback() }
+    }
+
     private val progressListener: UtteranceProgressListener = object : UtteranceProgressListener() {
 
         override fun onStart(utteranceId: String?) {
@@ -361,18 +381,29 @@ class VoiceController(private val context: Context) {
         }
 
         override fun onDone(utteranceId: String?) {
-            if (isOurUtterance(utteranceId)) speaking = false
+            if (isOurUtterance(utteranceId)) {
+                speaking = false
+                notifySpeakFinished()
+            }
         }
 
         // Deprecated since API 21 in favour of onError(String, int), yet still
         // abstract, so this override is mandatory: @Suppress silences the notice.
         @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onError(utteranceId: String?) {
-            if (isOurUtterance(utteranceId)) speaking = false
+            if (isOurUtterance(utteranceId)) {
+                speaking = false
+                // A failed utterance must still end the turn, or conversation mode
+                // would wait forever for a completion that never comes.
+                notifySpeakFinished()
+            }
         }
 
         override fun onError(utteranceId: String?, errorCode: Int) {
-            if (isOurUtterance(utteranceId)) speaking = false
+            if (isOurUtterance(utteranceId)) {
+                speaking = false
+                notifySpeakFinished()
+            }
         }
     }
 
