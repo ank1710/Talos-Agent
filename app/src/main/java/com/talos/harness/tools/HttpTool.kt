@@ -207,8 +207,8 @@ private fun redirectRequest(current: Request, code: Int, nextUrl: HttpUrl): Requ
 private fun sameOrigin(first: HttpUrl, second: HttpUrl): Boolean =
     first.scheme == second.scheme && first.host == second.host && first.port == second.port
 
-/** Resolve before connecting and reject every local, private, link-local, or reserved address. */
-private fun validateDestination(url: HttpUrl): String? {
+/** Resolve before connecting; shared with web_search so both tools enforce one destination policy. */
+internal fun validateDestination(url: HttpUrl): String? {
     if (url.scheme != "http" && url.scheme != "https") return "A URL precisa usar HTTP ou HTTPS."
     val addresses = try {
         Dns.SYSTEM.lookup(url.host)
@@ -222,7 +222,7 @@ private fun validateDestination(url: HttpUrl): String? {
     }
 }
 
-private fun isBlockedAddress(address: InetAddress): Boolean {
+internal fun isBlockedAddress(address: InetAddress): Boolean {
     if (
         address.isAnyLocalAddress || address.isLoopbackAddress || address.isLinkLocalAddress ||
         address.isSiteLocalAddress || address.isMulticastAddress

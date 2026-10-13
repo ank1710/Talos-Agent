@@ -330,6 +330,7 @@ fun decisionForGatewayChoice(choice: String): ApprovalDecision? = when (choice.l
 fun gatewayChoiceFor(decision: ApprovalDecision, advertised: List<String>): String {
     val aliases = when (decision) {
         ApprovalDecision.APPROVE_ONCE -> listOf("once", "approve", "approved", "allow")
+        ApprovalDecision.APPROVE_SESSION -> listOf("once", "approve", "approved", "allow")
         ApprovalDecision.APPROVE_ALWAYS -> listOf("always", "session")
         ApprovalDecision.REJECT -> listOf("deny")
     }

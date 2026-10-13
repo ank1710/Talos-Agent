@@ -10,7 +10,7 @@ import zipfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--source-check", action="store_true", help="Compile current non-UI sources against cached app dependencies")
-parser.add_argument("--suite", action="append", choices=["persistent", "settings", "markdown", "catalog", "approval_stream"],
+parser.add_argument("--suite", action="append", choices=["persistent", "settings", "markdown", "catalog", "approval_stream", "approval_policy"],
                     help="Run only the named suite(s); default runs all")
 options = parser.parse_args()
 
@@ -63,7 +63,8 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
         base = repo / "app/src/main/java/com/talos/harness"
         sources = [str(base / name) for name in [
             "store/Settings.kt", "store/ConnectionSettings.kt", "store/PlainTextStore.kt",
-            "store/MemoryStore.kt", "store/SkillStore.kt", "tools/SkillTool.kt", "tools/StoredData.kt",
+            "store/MemoryStore.kt", "store/SkillStore.kt", "agent/Approval.kt", "agent/AgentEvent.kt", "tools/SkillTool.kt", "tools/StoredData.kt",
+            "tools/HttpTool.kt", "tools/WebSearchTool.kt",
             "tools/MemoryTool.kt", "tools/SessionSearchTool.kt", "tools/SubagentTool.kt", "agent/SystemPrompt.kt",
             "agent/PersistentContext.kt", "gateway/GatewayApprovalGate.kt",
             "gateway/GatewayApprovalClient.kt", "llm/DeepSeekClient.kt",
@@ -76,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
                     "-d", str(target)] + [str(p) for p in sorted((repo / "tests/host").glob("*.kt"))] + sources, check=True)
     suites = {"persistent": "PersistentDataChecksKt", "settings": "SettingsChecksKt",
               "markdown": "MarkdownChecksKt", "catalog": "ModelCatalogChecksKt",
-              "approval_stream": "ApprovalStreamChecksKt"}
+              "approval_stream": "ApprovalStreamChecksKt", "approval_policy": "ApprovalPolicyChecksKt"}
     approval_source = (repo / "app/src/main/java/com/talos/harness/ui/ChatViewModel.kt").read_text()
     resolve_source = approval_source.split("fun resolveApproval(", 1)[1].split("\n    /**", 1)[0]
     post_source = approval_source.split("private suspend fun postDecision(", 1)[1].split("\n    fun dismissError", 1)[0]
@@ -97,6 +98,24 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
     print("PASS approval retry and acknowledgement source invariants")
     print("PASS OkHttp stream cancellation and idle timeout source invariant")
     print("PASS shell private-data approval warning source invariant")
+    settings_source = (repo / "app/src/main/java/com/talos/harness/store/Settings.kt").read_text()
+    assert all(name in settings_source for name in ["ApprovalPermissiveness", "shell_command_prefixes", "web_search_api_key", "web_search_provider"])
+    chat_vm = (repo / "app/src/main/java/com/talos/harness/ui/ChatViewModel.kt").read_text()
+    assert all(name in chat_vm for name in ["APPROVE_SESSION", "sessionApprovedActions", "shellPrefixGranted", "interactiveRequiresApproval"])
+    policy_source = (repo / "app/src/main/java/com/talos/harness/agent/Approval.kt").read_text()
+    assert "LOOSE_MODE_PRIVATE_TOOLS" in policy_source and "Risk.DANGEROUS" in policy_source
+    search_source = (repo / "app/src/main/java/com/talos/harness/tools/WebSearchTool.kt").read_text()
+    assert "override val risk = Risk.CAUTION" in search_source
+    assert "storedData(JsonArray(results))" in search_source and "validateDestination(active.url)" in search_source
+    assert "validateDestination(next)" in search_source and "MAX_REDIRECTS" in search_source
+    assert '"api_key", apiKey' in search_source and '"X-Subscription-Token", apiKey' in search_source
+    registry_source = (repo / "app/src/main/java/com/talos/harness/ui/ChatViewModel.kt").read_text()
+    worker_source = (repo / "app/src/main/java/com/talos/harness/schedule/ScheduledAgentWorker.kt").read_text()
+    assert "WebSearchTool(settings.webSearchProvider, settings.webSearchApiKey)" in registry_source
+    assert "WebSearchTool" not in worker_source and "UnattendedApprovalGate" in worker_source
+    assert "APPROVE_SESSION" in approval_dialog and "Liberar prefixo" in approval_dialog
+    assert "settings.shellCommandPrefixes" in (repo / "app/src/main/java/com/talos/harness/ui/settings/SettingsScreen.kt").read_text()
+    print("PASS 10 web-search, interactive-policy, shell-prefix and unattended-boundary source checks")
     print("MODE: current non-UI sources + cached app dependencies" if options.source_check else "MODE: cached assembleDebug classes", flush=True)
     for selected in options.suite or suites:
         suite = suites[selected]

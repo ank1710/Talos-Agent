@@ -9,6 +9,7 @@ import com.talos.harness.agent.AgentLoop
 import com.talos.harness.agent.ApprovalDecision
 import com.talos.harness.agent.ApprovalGate
 import com.talos.harness.agent.ApprovalRequest
+import com.talos.harness.agent.interactiveRequiresApproval
 import com.talos.harness.agent.Attachment
 import com.talos.harness.agent.ChatMessage
 import com.talos.harness.agent.Conversation
@@ -55,6 +56,8 @@ import com.talos.harness.store.ModelMode
 import com.talos.harness.store.ProviderCatalog
 import com.talos.harness.store.ProviderModel
 import com.talos.harness.store.TalosSettings
+import com.talos.harness.store.ApprovalPermissiveness
+import com.talos.harness.store.WebSearchProvider
 import com.talos.harness.store.SettingsRepository
 import com.talos.harness.tools.CalendarReadTool
 import com.talos.harness.tools.ClipboardReadTool
@@ -76,6 +79,7 @@ import com.talos.harness.tools.Tool
 import com.talos.harness.tools.ToolContext
 import com.talos.harness.tools.ToolRegistry
 import com.talos.harness.tools.WriteFileTool
+import com.talos.harness.tools.WebSearchTool
 import com.talos.harness.voice.VoiceController
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -87,6 +91,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.first
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -342,6 +348,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // Network. CAUTION: an unattended run must not be able to POST
                 // your data anywhere without you opting that task in.
                 add(FetchUrlTool())
+                add(WebSearchTool(settings.webSearchProvider, settings.webSearchApiKey))
                 add(MemoryTool(memoryStore, origin, userMessage))
                 add(SessionSearchTool(conversationStore))
                 add(SkillTool(skillStore, origin))
@@ -391,14 +398,28 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Mirrors the persisted allowlist so the gate can answer without I/O. */
     private var autoApproved: Set<String> = emptySet()
+    private var shellCommandPrefixes: Set<String> = emptySet()
+    private var approvalPermissiveness: ApprovalPermissiveness = ApprovalPermissiveness.BALANCED
+    private val sessionApprovedActions = mutableSetOf<String>()
 
     private val approvalGate = object : ApprovalGate {
+        override fun requiresApproval(request: ApprovalRequest): Boolean {
+            // This interactive policy never reaches the worker's separate unattended allowlist.
+            return interactiveRequiresApproval(request, approvalPermissiveness)
+        }
         override suspend fun request(request: ApprovalRequest): ApprovalDecision {
-            if (request.toolName in autoApproved) return ApprovalDecision.APPROVE_ONCE
+            val signature = "${request.toolName}\u0000${request.arguments}"
+            val requireFreshConsent = approvalPermissiveness == ApprovalPermissiveness.STRICT || request.risk == Risk.DANGEROUS
+            if (!requireFreshConsent && signature in sessionApprovedActions) return ApprovalDecision.APPROVE_ONCE
+            if (!requireFreshConsent && request.toolName == "shell" && shellPrefixGranted(request.arguments, shellCommandPrefixes)) return ApprovalDecision.APPROVE_ONCE
+            if (!requireFreshConsent && request.toolName != "shell" && request.toolName in autoApproved) return ApprovalDecision.APPROVE_ONCE
 
             val deferred = CompletableDeferred<ApprovalDecision>()
             approvalDeferred = deferred
-            _state.update { it.copy(pendingApproval = request) }
+            val visibleRequest = if (requireFreshConsent) request.copy(
+                choices = listOf(ApprovalDecision.APPROVE_ONCE, ApprovalDecision.REJECT),
+            ) else request
+            _state.update { it.copy(pendingApproval = visibleRequest) }
             return try {
                 deferred.await()
             } finally {
@@ -440,6 +461,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             settingsRepo.flow.collect { settings ->
                 autoApproved = settings.autoApprovedTools
+                shellCommandPrefixes = settings.shellCommandPrefixes
+                approvalPermissiveness = settings.approvalPermissiveness
                 _state.update {
                     it.copy(
                         settings = settings,
@@ -612,8 +635,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             gatewayGate.submit(decision)
         }
 
-        if (decision == ApprovalDecision.APPROVE_ALWAYS && request != null) {
-            viewModelScope.launch { settingsRepo.approveAlways(request.toolName) }
+        if (request != null) when (decision) {
+            ApprovalDecision.APPROVE_SESSION -> sessionApprovedActions += "${request.toolName}\u0000${request.arguments}"
+            ApprovalDecision.APPROVE_ALWAYS -> viewModelScope.launch {
+                if (request.toolName == "shell") {
+                    val command = shellCommandFromArguments(request.arguments)
+                    if (command.isNotBlank()) settingsRepo.approveShellPrefix(command)
+                } else settingsRepo.approveAlways(request.toolName)
+            }
+            else -> Unit
         }
         approvalDeferred?.complete(decision)
         // A prompt a local tool parked on the bridge gate was settled by the
@@ -1304,6 +1334,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateTemperature(value: Double) = viewModelScope.launch { settingsRepo.setTemperature(value) }
 
+    fun updateApprovalPermissiveness(value: ApprovalPermissiveness) = viewModelScope.launch { settingsRepo.setApprovalPermissiveness(value) }
+    suspend fun saveWebSearch(provider: WebSearchProvider, apiKey: String): Result<Unit> = try {
+        settingsRepo.setWebSearch(provider, apiKey)
+        Result.success(Unit)
+    } catch (e: Exception) { Result.failure(e) }
+
     /**
      * Re-reads what is on disk.
      *
@@ -1600,6 +1636,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun revokeApproval(toolName: String) = viewModelScope.launch { settingsRepo.revokeApproval(toolName) }
+    fun revokeShellPrefix(prefix: String) = viewModelScope.launch { settingsRepo.revokeShellPrefix(prefix) }
 
     fun clearApprovals() = viewModelScope.launch { settingsRepo.clearApprovals() }
 
@@ -1685,4 +1722,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
     }
+}
+
+private fun shellCommandFromArguments(arguments: String): String = runCatching {
+    kotlinx.serialization.json.Json.parseToJsonElement(arguments).jsonObject["command"]
+        ?.jsonPrimitive?.content?.trim().orEmpty().replace(Regex("\\s+"), " ")
+}.getOrDefault("")
+
+private fun shellPrefixGranted(arguments: String, prefixes: Set<String>): Boolean {
+    val command = shellCommandFromArguments(arguments)
+    // A prefix is a consent shortcut only; shell syntax means it cannot sandbox file access.
+    return command.isNotBlank() && prefixes.any { prefix -> command == prefix || command.startsWith("$prefix ") }
 }

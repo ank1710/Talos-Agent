@@ -930,6 +930,8 @@ private fun ApprovalDialog(request: ApprovalRequest, onDecision: (ApprovalDecisi
         },
         text = {
             Column {
+                Text("Ação exata solicitada", style = MaterialTheme.typography.labelMedium, color = palette.textSecondary)
+                Spacer(modifier = Modifier.height(4.dp))
                 Surface(
                     color = palette.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
@@ -948,40 +950,62 @@ private fun ApprovalDialog(request: ApprovalRequest, onDecision: (ApprovalDecisi
                             .padding(10.dp),
                     )
                 }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Parâmetros exatos",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = palette.textSecondary,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Surface(
+                    color = palette.surfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = request.arguments,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = palette.textPrimary,
+                        modifier = Modifier
+                            .heightIn(max = 160.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(10.dp),
+                    )
+                }
                 if (request.toolName == "shell") {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "Ao aprovar, o comando poderá ler e alterar arquivos privados do Talos, incluindo memória, skills, conversas e configurações.",
+                        text = "O shell executa como o Talos e pode ler e alterar arquivos privados do Talos (dados privados do app), incluindo memória, skills, conversas e configurações. “Liberar prefixo” grava o comando mostrado; comandos que começam com ele poderão passar sem perguntar, mas isso não confina o acesso do shell.",
                         style = MaterialTheme.typography.bodySmall,
                         color = palette.danger,
                     )
                 }
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = "O agente fica parado esperando sua resposta.",
+                    text = "“Nesta sessão” memoriza somente esta chamada enquanto o app estiver aberto. O agente está aguardando sua resposta.",
                     style = MaterialTheme.typography.labelSmall,
                     color = palette.textFaint,
                 )
             }
         },
         confirmButton = {
-            if (ApprovalDecision.APPROVE_ONCE in offered) {
-                TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ONCE) }) {
-                    Text("Permitir", color = palette.brand)
+            Column(horizontalAlignment = Alignment.End) {
+                if (ApprovalDecision.APPROVE_ONCE in offered) TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ONCE) }) {
+                    Text("Uma vez", color = palette.brand)
+                }
+                if (ApprovalDecision.APPROVE_SESSION in offered) TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_SESSION) }) {
+                    Text("Permitir nesta sessão", color = palette.brand)
+                }
+                if (ApprovalDecision.APPROVE_ALWAYS in offered) TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ALWAYS) }) {
+                    Text(if (request.toolName == "shell") "Liberar prefixo" else "Sempre", color = palette.textSecondary)
                 }
             }
         },
         dismissButton = {
-            Row {
-                if (ApprovalDecision.REJECT in offered) {
-                    TextButton(onClick = { onDecision(ApprovalDecision.REJECT) }) {
-                        Text("Recusar", color = palette.danger)
-                    }
-                }
-                if (ApprovalDecision.APPROVE_ALWAYS in offered) {
-                    TextButton(onClick = { onDecision(ApprovalDecision.APPROVE_ALWAYS) }) {
-                        Text("Sempre", color = palette.textSecondary)
-                    }
+            if (ApprovalDecision.REJECT in offered) {
+                TextButton(onClick = { onDecision(ApprovalDecision.REJECT) }) {
+                    Text("Recusar", color = palette.danger)
                 }
             }
         },
