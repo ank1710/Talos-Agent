@@ -425,6 +425,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         },
     )
 
+    /** A prompt stays parked while its decision POST is in flight. */
+    private val approvalPostsInFlight = mutableSetOf<String>()
+
     init {
         viewModelScope.launch {
             settingsRepo.flow.collect { settings ->
@@ -551,21 +554,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * A prompt from the desktop is answered over HTTP — the desktop is the side
      * that is blocked — while a local tool call only needs its coroutine
      * resumed. The gate publishes prompts FIFO, so the one on screen is the
-     * oldest; [GatewayApprovalGate.submit] settles it and reports which entry
-     * that was, so the POST carries the ids of the prompt the user actually saw
-     * even if a frame answered a different prompt in between.
+     * oldest; its captured ids travel with the POST, and the gate is settled
+     * only after the gateway acknowledges that decision.
      */
     fun resolveApproval(decision: ApprovalDecision) {
         val request = _state.value.pendingApproval
-        val answered = gatewayGate.submit(decision)
-        if (answered?.runId != null) {
+        val oldest = gatewayGate.oldest
+        if (oldest?.runId != null && oldest.request.id == request?.id) {
+            val answered = oldest
             val choice = gatewayChoiceFor(decision, answered.choices)
-            // The dialog is not cleared here on purpose. Completing the parked
-            // deferred can resume its coroutine inline on the main thread, whose
-            // onSettled/onPending may already have published the *next* prompt;
-            // clearing `pendingApproval` now would wipe that one off the screen
-            // and leave it parked with nothing to answer. onSettled clears the
-            // entry that was actually answered.
+            // Keep this exact prompt parked until the gateway acknowledges the
+            // POST. A transport failure must leave the same ids available to retry.
             val lifecycle = runJob
             if (answered.target == null || answered.runId.isBlank() || lifecycle == null || !lifecycle.isActive) {
                 _state.update {
@@ -576,10 +575,23 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 return
             }
-            // As a child of the stream job, this POST cannot outlive Stop. The
-            // client also cancels the underlying OkHttp call when this job ends.
-            viewModelScope.launch(lifecycle) { postDecision(answered, choice) }
+            val postKey = answered.requestId ?: answered.request.id
+            if (!approvalPostsInFlight.add(postKey)) return
+            // As a child of the stream job, this POST cannot outlive Stop.
+            viewModelScope.launch(lifecycle) {
+                try {
+                    postDecision(answered, choice, decision)
+                } finally {
+                    approvalPostsInFlight.remove(postKey)
+                }
+            }
             return
+        }
+
+        // Local tools parked on this gate have no desktop run and need only a
+        // local resume. Remote prompts are never completed before their POST.
+        if (oldest?.runId == null && oldest?.request?.id == request?.id) {
+            gatewayGate.submit(decision)
         }
 
         if (decision == ApprovalDecision.APPROVE_ALWAYS && request != null) {
@@ -686,7 +698,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * A 409 (`approval_not_pending`) is a soft outcome: the prompt was already
      * answered or expired, which needs no error banner — just a note.
      */
-    private suspend fun postDecision(answered: GatewayApprovalGate.Parked, choice: String) {
+    private suspend fun postDecision(
+        answered: GatewayApprovalGate.Parked,
+        choice: String,
+        decision: ApprovalDecision,
+    ) {
         val settings = _state.value.settings
         val target = answered.target ?: return
         // The run lives on the gateway; if the user switched back to DeepSeek
@@ -730,10 +746,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 requestId = answered.requestId,
             )
             .onSuccess {
+                gatewayGate.submitFor(answered.requestId ?: answered.request.id, decision)
                 _state.update { it.copy(statusMessage = "Resposta enviada ao PC.", statusIsError = false) }
             }
             .onFailure { error ->
                 if (error is GatewayApprovalClient.AlreadyResolved) {
+                    gatewayGate.submitFor(answered.requestId ?: answered.request.id, decision)
                     _state.update {
                         it.copy(
                             statusMessage = error.message ?: "Este pedido já foi respondido.",

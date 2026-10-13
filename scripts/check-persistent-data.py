@@ -10,7 +10,7 @@ import zipfile
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--source-check", action="store_true", help="Compile current non-UI sources against cached app dependencies")
-parser.add_argument("--suite", action="append", choices=["persistent", "settings", "markdown", "catalog"],
+parser.add_argument("--suite", action="append", choices=["persistent", "settings", "markdown", "catalog", "approval_stream"],
                     help="Run only the named suite(s); default runs all")
 options = parser.parse_args()
 
@@ -65,7 +65,8 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
             "store/Settings.kt", "store/ConnectionSettings.kt", "store/PlainTextStore.kt",
             "store/MemoryStore.kt", "store/SkillStore.kt", "tools/SkillTool.kt", "tools/StoredData.kt",
             "tools/MemoryTool.kt", "tools/SessionSearchTool.kt", "tools/SubagentTool.kt", "agent/SystemPrompt.kt",
-            "agent/PersistentContext.kt", "llm/DeepSeekClient.kt",
+            "agent/PersistentContext.kt", "gateway/GatewayApprovalGate.kt",
+            "gateway/GatewayApprovalClient.kt", "llm/DeepSeekClient.kt",
             "ui/markdown/OrderedListLine.kt", "local/HuggingFaceModelCatalog.kt",
         ]]
     subprocess.run([str(java), "-cp", os.pathsep.join(compiler), "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler",
@@ -74,7 +75,28 @@ with tempfile.TemporaryDirectory(prefix="talos-host-checks-") as directory:
                     "-Xfriend-paths=" + str(classes),
                     "-d", str(target)] + [str(p) for p in sorted((repo / "tests/host").glob("*.kt"))] + sources, check=True)
     suites = {"persistent": "PersistentDataChecksKt", "settings": "SettingsChecksKt",
-              "markdown": "MarkdownChecksKt", "catalog": "ModelCatalogChecksKt"}
+              "markdown": "MarkdownChecksKt", "catalog": "ModelCatalogChecksKt",
+              "approval_stream": "ApprovalStreamChecksKt"}
+    approval_source = (repo / "app/src/main/java/com/talos/harness/ui/ChatViewModel.kt").read_text()
+    resolve_source = approval_source.split("fun resolveApproval(", 1)[1].split("\n    /**", 1)[0]
+    post_source = approval_source.split("private suspend fun postDecision(", 1)[1].split("\n    fun dismissError", 1)[0]
+    assert "gatewayGate.oldest" in resolve_source
+    assert "gatewayGate.submit(decision)" not in resolve_source.split("val oldest", 1)[0]
+    assert "gatewayGate.submitFor" in post_source and "error is GatewayApprovalClient.AlreadyResolved" in post_source
+    gateway_client = (repo / "app/src/main/java/com/talos/harness/gateway/GatewayApprovalClient.kt").read_text()
+    assert "response.code == 409 -> Result.failure(" in gateway_client
+    assert "AlreadyResolved(" in gateway_client
+    deepseek_source = (repo / "app/src/main/java/com/talos/harness/llm/DeepSeekClient.kt").read_text()
+    assert "invokeOnCancellation { cancel() }" in deepseek_source
+    assert "cancelCallOnCancellation(call)" in deepseek_source
+    assert "STREAM_IDLE_TIMEOUT_SECONDS = 60L" in deepseek_source
+    assert "timeout().timeout(STREAM_CALL_TIMEOUT_MINUTES" in deepseek_source
+    approval_dialog = (repo / "app/src/main/java/com/talos/harness/ui/ChatScreen.kt").read_text()
+    assert "request.toolName == \"shell\"" in approval_dialog
+    assert "arquivos privados do Talos" in approval_dialog
+    print("PASS approval retry and acknowledgement source invariants")
+    print("PASS OkHttp stream cancellation and idle timeout source invariant")
+    print("PASS shell private-data approval warning source invariant")
     print("MODE: current non-UI sources + cached app dependencies" if options.source_check else "MODE: cached assembleDebug classes", flush=True)
     for selected in options.suite or suites:
         suite = suites[selected]

@@ -918,6 +918,14 @@ private fun ApprovalDialog(request: ApprovalRequest, onDecision: (ApprovalDecisi
                             .padding(10.dp),
                     )
                 }
+                if (request.toolName == "shell") {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Ao aprovar, o comando poderá ler e alterar arquivos privados do Talos, incluindo memória, skills, conversas e configurações.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.danger,
+                    )
+                }
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
                     text = "O agente fica parado esperando sua resposta.",

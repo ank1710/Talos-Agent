@@ -6,11 +6,16 @@ import com.talos.harness.store.ProviderAuthStyle
 import com.talos.harness.store.ProviderCatalog
 import com.talos.harness.store.ProviderModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.DisposableHandle
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.job
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -19,11 +24,16 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.Call
+import okhttp3.Callback
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * Talks to an OpenAI-compatible chat endpoint using the selected provider's auth.
@@ -36,6 +46,11 @@ class DeepSeekClient(
     private val http: OkHttpClient = defaultHttpClient(),
     private val provider: Provider = ProviderCatalog.DEEPSEEK,
 ) : ChatBackend {
+
+    // SSE may be long-lived, but a silent stream and an abandoned call must be bounded.
+    private val streamHttp by lazy {
+        http.newBuilder().readTimeout(STREAM_IDLE_TIMEOUT_SECONDS, TimeUnit.SECONDS).build()
+    }
 
     // Settings checks must finish promptly and must not forward a scoped key through a redirect.
     private val discoveryHttp by lazy {
@@ -73,7 +88,12 @@ class DeepSeekClient(
             .build()
 
         try {
-            http.newCall(httpRequest).execute().use { response ->
+            val call = streamHttp.newCall(httpRequest).apply {
+                timeout().timeout(STREAM_CALL_TIMEOUT_MINUTES, TimeUnit.MINUTES)
+            }
+            val cancellation = currentCoroutineContext().job.cancelCallOnCancellation(call)
+            try {
+                call.awaitResponse().use { response ->
                 val body = response.body
                 if (!response.isSuccessful) {
                     val text = runCatching { body.string() }.getOrDefault("")
@@ -149,9 +169,13 @@ class DeepSeekClient(
                         }
                     }
                 }
-                if (!sawTerminal) emit(StreamEvent.Finished(null))
+                    if (!sawTerminal) emit(StreamEvent.Finished(null))
+                }
+            } finally {
+                cancellation.dispose()
             }
         } catch (e: IOException) {
+            currentCoroutineContext().ensureActive()
             emit(StreamEvent.Failed(e.message ?: "falha de rede", retryable = true))
         }
     }.flowOn(Dispatchers.IO)
@@ -278,6 +302,9 @@ class DeepSeekClient(
     companion object {
         private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
+        private const val STREAM_IDLE_TIMEOUT_SECONDS = 60L
+        private const val STREAM_CALL_TIMEOUT_MINUTES = 5L
+
         /** Streaming responses stay open for a long time, so the read timeout is generous. */
         fun defaultHttpClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
@@ -288,3 +315,24 @@ class DeepSeekClient(
             .build()
     }
 }
+
+/** Enqueueing keeps cancellation connected to OkHttp even while the SSE body is blocked in a read. */
+private suspend fun Call.awaitResponse(): Response = suspendCancellableCoroutine { continuation ->
+    continuation.invokeOnCancellation { cancel() }
+    enqueue(object : Callback {
+        override fun onFailure(call: Call, e: IOException) {
+            continuation.resumeWithException(e)
+        }
+
+        override fun onResponse(call: Call, response: Response) {
+            continuation.resume(response) { _, value, _ -> value.close() }
+        }
+    })
+}
+
+/** A Job cancellation must cancel the Call even after headers arrived and a blocking body read began. */
+@OptIn(InternalCoroutinesApi::class)
+private fun Job.cancelCallOnCancellation(call: Call): DisposableHandle =
+    invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+        if (cause != null) call.cancel()
+    }
