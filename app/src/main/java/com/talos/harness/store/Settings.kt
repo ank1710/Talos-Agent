@@ -26,6 +26,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
  * ends up posted somewhere it does not belong.
  */
 enum class ModelMode { CLOUD, DESKTOP, ON_DEVICE }
+enum class ApprovalPermissiveness { STRICT, BALANCED, LOOSE }
+enum class WebSearchProvider { TAVILY, BRAVE }
 
 /**
  * Everything the harness needs to reach a model.
@@ -59,6 +61,10 @@ data class TalosSettings(
     val localModel: String = "",
     val memoryEnabled: Boolean = true,
     val memoryInRemote: Boolean = true,
+    val approvalPermissiveness: ApprovalPermissiveness = ApprovalPermissiveness.BALANCED,
+    val shellCommandPrefixes: Set<String> = emptySet(),
+    val webSearchProvider: WebSearchProvider = WebSearchProvider.TAVILY,
+    val webSearchApiKey: String = "",
 ) {
     /** Provider behavior is derived from the persisted id, with safe legacy fallback. */
     val provider: Provider get() = ProviderCatalog.byId(providerId) ?: ProviderCatalog.CUSTOM
@@ -177,6 +183,10 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val memoryInRemote = booleanPreferencesKey("memory_in_remote")
         val localModel = stringPreferencesKey("local_model")
         val cloudProvider = stringPreferencesKey("last_cloud_provider")
+        val approvalPermissiveness = stringPreferencesKey("approval_permissiveness")
+        val shellCommandPrefixes = stringSetPreferencesKey("shell_command_prefixes")
+        val webSearchProvider = stringPreferencesKey("web_search_provider")
+        val webSearchApiKey = stringPreferencesKey("web_search_api_key")
     }
 
     private fun profileUrl(id: String) = stringPreferencesKey("profile_url_$id")
@@ -214,9 +224,13 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             gatewayApiKey = keys[credentialScope(providerId, baseUrl, true)].orEmpty(),
             model = prefs[Keys.model] ?: TalosSettings.DEFAULT_MODEL,
             temperature = (prefs[Keys.temperature] ?: TalosSettings.DEFAULT_TEMPERATURE.toFloat()).toDouble(),
-            autoApprovedTools = prefs[Keys.autoApprovedTools] ?: emptySet(), credentials = keys, profiles = profiles,
+            autoApprovedTools = (prefs[Keys.autoApprovedTools] ?: emptySet()) - "shell", credentials = keys, profiles = profiles,
             localModel = prefs[Keys.localModel] ?: if (mode == ModelMode.ON_DEVICE) prefs[Keys.model].orEmpty() else "",
             memoryEnabled = prefs[Keys.memoryEnabled] ?: true, memoryInRemote = prefs[Keys.memoryInRemote] ?: true,
+            approvalPermissiveness = ApprovalPermissiveness.entries.firstOrNull { it.name == prefs[Keys.approvalPermissiveness] } ?: ApprovalPermissiveness.BALANCED,
+            shellCommandPrefixes = prefs[Keys.shellCommandPrefixes] ?: emptySet(),
+            webSearchProvider = WebSearchProvider.entries.firstOrNull { it.name == prefs[Keys.webSearchProvider] } ?: WebSearchProvider.TAVILY,
+            webSearchApiKey = prefs[Keys.webSearchApiKey].orEmpty(),
         )
     }
 
@@ -292,6 +306,19 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         it[Keys.temperature] = value.coerceIn(0.0, 2.0).toFloat()
     }
 
+    suspend fun setApprovalPermissiveness(value: ApprovalPermissiveness) = dataStore.edit { it[Keys.approvalPermissiveness] = value.name }
+    suspend fun setWebSearch(provider: WebSearchProvider, apiKey: String) = dataStore.edit {
+        it[Keys.webSearchProvider] = provider.name
+        it[Keys.webSearchApiKey] = apiKey.trim()
+    }
+    suspend fun approveShellPrefix(prefix: String) = dataStore.edit { prefs ->
+        val normalized = prefix.trim().replace(Regex("\\s+"), " ")
+        if (normalized.isNotEmpty()) prefs[Keys.shellCommandPrefixes] = (prefs[Keys.shellCommandPrefixes] ?: emptySet()) + normalized
+    }
+    suspend fun revokeShellPrefix(prefix: String) = dataStore.edit { prefs ->
+        prefs[Keys.shellCommandPrefixes] = (prefs[Keys.shellCommandPrefixes] ?: emptySet()) - prefix
+    }
+
     suspend fun approveAlways(toolName: String) = dataStore.edit { prefs ->
         prefs[Keys.autoApprovedTools] = (prefs[Keys.autoApprovedTools] ?: emptySet()) + toolName
     }
@@ -300,5 +327,5 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         prefs[Keys.autoApprovedTools] = (prefs[Keys.autoApprovedTools] ?: emptySet()) - toolName
     }
 
-    suspend fun clearApprovals() = dataStore.edit { it.remove(Keys.autoApprovedTools) }
+    suspend fun clearApprovals() = dataStore.edit { it.remove(Keys.autoApprovedTools); it.remove(Keys.shellCommandPrefixes) }
 }

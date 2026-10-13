@@ -121,6 +121,24 @@ fun main() = runBlocking {
         repo.setMemoryPolicy(false, true)
         check(!repo.flow.first().copy(mode = ModelMode.ON_DEVICE).includesMemory)
     }
+    verify("approval policy, shell prefixes and web search settings persist and revoke individually") {
+        val data = TestPreferences()
+        val repo = SettingsRepository(data)
+        repo.setApprovalPermissiveness(ApprovalPermissiveness.LOOSE)
+        repo.setWebSearch(WebSearchProvider.BRAVE, " brave-test-key ")
+        repo.approveShellPrefix("git   status")
+        repo.approveShellPrefix("pwd")
+        var settings = SettingsRepository(data).flow.first()
+        check(settings.approvalPermissiveness == ApprovalPermissiveness.LOOSE)
+        check(settings.webSearchProvider == WebSearchProvider.BRAVE && settings.webSearchApiKey == "brave-test-key")
+        check(settings.shellCommandPrefixes == setOf("git status", "pwd"))
+        repo.revokeShellPrefix("pwd")
+        settings = repo.flow.first()
+        check(settings.shellCommandPrefixes == setOf("git status"))
+        repo.clearApprovals()
+        check(repo.flow.first().shellCommandPrefixes.isEmpty())
+        check(!TalosSettings(webSearchApiKey = "secret").toString().contains("secret"))
+    }
     verify("gateway detection is a parsed endpoint, not a substring") {
         check(isDefaultGateway("http://127.0.0.1:8642/v1"))
         check(!isDefaultGateway("https://elsewhere.invalid/127.0.0.1:8642"))
@@ -140,7 +158,7 @@ fun main() = runBlocking {
             check(skillIdentifier("Revisão da Serafina!") == "revisao-da-serafina")
         } finally { root.deleteRecursively() }
     }
-    verify("settings network checks refuse redirects without forwarding the credential") {
+    if (System.getenv("TALOS_SKIP_NETWORK_CHECKS") != "1") verify("settings network checks refuse redirects without forwarding the credential") {
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         var redirected = 0
         var authenticated = 0

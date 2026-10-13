@@ -1,5 +1,7 @@
 package com.talos.harness.agent
 
+import com.talos.harness.store.ApprovalPermissiveness
+
 /** A tool call the model wants to make, presented to the user for a decision. */
 data class ApprovalRequest(
     val id: String,
@@ -21,6 +23,7 @@ data class ApprovalRequest(
 
 enum class ApprovalDecision {
     APPROVE_ONCE,
+    APPROVE_SESSION,
     APPROVE_ALWAYS,
     REJECT,
 }
@@ -40,3 +43,19 @@ interface ApprovalGate {
 
     suspend fun request(request: ApprovalRequest): ApprovalDecision
 }
+
+/** Shared interactive policy; unattended execution deliberately has a separate gate. */
+internal fun interactiveRequiresApproval(request: ApprovalRequest, mode: ApprovalPermissiveness): Boolean {
+    if (request.risk == Risk.DANGEROUS) return true
+    return when (mode) {
+        ApprovalPermissiveness.STRICT -> true
+        ApprovalPermissiveness.BALANCED -> request.risk != Risk.SAFE
+        // Private readers stay gated even when a legacy tool labels one SAFE.
+        ApprovalPermissiveness.LOOSE -> request.toolName in LOOSE_MODE_PRIVATE_TOOLS
+    }
+}
+
+private val LOOSE_MODE_PRIVATE_TOOLS = setOf(
+    "shell", "read_file", "list_dir", "clipboard_read", "calendar_read", "contacts_search",
+    "memory", "session_search", "skill",
+)

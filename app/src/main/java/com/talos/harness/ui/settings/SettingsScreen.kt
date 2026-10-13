@@ -49,6 +49,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -59,6 +60,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import kotlinx.coroutines.launch
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -79,6 +81,8 @@ import com.talos.harness.store.ModelMode
 import com.talos.harness.store.ProviderCatalog
 import com.talos.harness.store.ProviderModel
 import com.talos.harness.store.TalosSettings
+import com.talos.harness.store.ApprovalPermissiveness
+import com.talos.harness.store.WebSearchProvider
 import com.talos.harness.ui.LocalModelDownloadStatus
 import com.talos.harness.ui.theme.TalosColors
 import java.util.Locale
@@ -98,6 +102,7 @@ private enum class SettingsSection(val title: String) {
     CONNECTION("Provedor e conexão"),
     MODEL("Modelo"),
     APPROVALS("Aprovações"),
+    WEB_SEARCH("Busca na web"),
     MEMORY("Memória"),
     SKILLS("Skills"),
     DIAGNOSTICS("Diagnóstico"),
@@ -178,6 +183,9 @@ fun SettingsScreen(
     onTestConnection: () -> Unit,
     onRevokeApproval: (String) -> Unit,
     onClearApprovals: () -> Unit,
+    onRevokeShellPrefix: (String) -> Unit,
+    onApprovalPermissiveness: (ApprovalPermissiveness) -> Unit,
+    onSaveWebSearch: suspend (WebSearchProvider, String) -> Result<Unit>,
     onBack: () -> Unit,
     memories: List<MemoryEntry>,
     skills: List<SkillEntry>,
@@ -323,7 +331,10 @@ fun SettingsScreen(
                     settings = settings,
                     onRevokeApproval = onRevokeApproval,
                     onClearApprovals = onClearApprovals,
+                    onRevokeShellPrefix = onRevokeShellPrefix,
+                    onPolicyChange = onApprovalPermissiveness,
                 )
+                SettingsSection.WEB_SEARCH -> WebSearchSection(settings, onSaveWebSearch)
 
                 SettingsSection.DIAGNOSTICS -> if (settings.mode == ModelMode.ON_DEVICE) {
                     Text("Diagnóstico local", style = MaterialTheme.typography.titleMedium)
@@ -391,6 +402,11 @@ private fun RootSection(
         title = SettingsSection.MODEL.title,
         summary = modelSummary(settings),
         onClick = { onOpen(SettingsSection.MODEL) },
+    )
+    SettingsMenuRow(
+        title = SettingsSection.WEB_SEARCH.title,
+        summary = "${if (settings.webSearchProvider == WebSearchProvider.TAVILY) "Tavily" else "Brave"} · ${if (settings.webSearchApiKey.isBlank()) "chave não configurada" else "chave configurada"}",
+        onClick = { onOpen(SettingsSection.WEB_SEARCH) },
     )
     SectionHeader("Memória e procedimentos")
     SettingsMenuRow(
@@ -1202,13 +1218,31 @@ private fun ApprovalsSection(
     settings: TalosSettings,
     onRevokeApproval: (String) -> Unit,
     onClearApprovals: () -> Unit,
+    onRevokeShellPrefix: (String) -> Unit,
+    onPolicyChange: (ApprovalPermissiveness) -> Unit,
 ) {
     val palette = TalosColors.current
     val approved = settings.autoApprovedTools.sorted()
 
+    Text("Permissividade global", style = MaterialTheme.typography.titleMedium, color = palette.textPrimary)
+    listOf(
+        ApprovalPermissiveness.STRICT to ("Estrito" to "Tudo pergunta, inclusive ferramentas SAFE."),
+        ApprovalPermissiveness.BALANCED to ("Equilibrado" to "SAFE passa direto; CAUTION pergunta."),
+        ApprovalPermissiveness.LOOSE to ("Solto" to "CAUTION passa direto, exceto shell, arquivos/listagens, área de transferência, agenda, contatos, memória, histórico e skills."),
+    ).forEach { (mode, copy) ->
+        Row(Modifier.fillMaxWidth().clickable { onPolicyChange(mode) }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            androidx.compose.material3.RadioButton(selected = settings.approvalPermissiveness == mode, onClick = { onPolicyChange(mode) })
+            Column(Modifier.padding(start = 8.dp)) {
+                Text(copy.first, color = palette.textPrimary, style = MaterialTheme.typography.bodyLarge)
+                Text(copy.second, color = palette.textSecondary, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+    Text("Ferramentas DANGEROUS sempre pedem confirmação. Esta preferência vale só para conversas interativas; tarefas agendadas usam a allowlist própria.", style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
+    Spacer(Modifier.height(12.dp))
+
     Text(
-        text = "Estas liberações dispensam a confirmação para toda a ferramenta, em qualquer conversa futura, até você revogar. " +
-            "Uma liberação de shell vale para qualquer comando. As tarefas agendadas mantêm sua política própria.",
+        text = "As tarefas agendadas mantêm sua allowlist própria. Liberações abaixo valem apenas para conversas interativas.",
         style = MaterialTheme.typography.bodyMedium,
         color = palette.textSecondary,
     )
@@ -1252,13 +1286,61 @@ private fun ApprovalsSection(
             }
         }
         Spacer(modifier = Modifier.height(8.dp))
-        OutlinedButton(
-            onClick = onClearApprovals,
-            shape = RoundedCornerShape(12.dp),
-        ) {
-            Text(text = "Revogar todas as aprovações")
+    }
+    Spacer(Modifier.height(14.dp))
+    Text("Prefixos de shell liberados", style = MaterialTheme.typography.titleMedium, color = palette.textPrimary)
+    Text("Cada prefixo autoriza comandos que começam com esse texto. Isso não confina o shell: ele roda como o Talos e pode ler e alterar arquivos privados do app, incluindo memória, skills, conversas e configurações.", style = MaterialTheme.typography.bodySmall, color = palette.danger)
+    if (settings.shellCommandPrefixes.isEmpty()) {
+        Text("Nenhum prefixo liberado.", style = MaterialTheme.typography.bodyMedium, color = palette.textFaint)
+    } else settings.shellCommandPrefixes.sorted().forEach { prefix ->
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(prefix, modifier = Modifier.weight(1f), fontFamily = FontFamily.Monospace, color = palette.textPrimary)
+            TextButton(onClick = { onRevokeShellPrefix(prefix) }) { Text("Revogar") }
         }
     }
+    if (approved.isNotEmpty() || settings.shellCommandPrefixes.isNotEmpty()) {
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = onClearApprovals, shape = RoundedCornerShape(12.dp)) {
+            Text("Revogar todas as liberações")
+        }
+    }
+}
+
+@Composable
+private fun WebSearchSection(
+    settings: TalosSettings,
+    onSave: suspend (WebSearchProvider, String) -> Result<Unit>,
+) {
+    val palette = TalosColors.current
+    val scope = rememberCoroutineScope()
+    var providerName by rememberSaveable { mutableStateOf(settings.webSearchProvider.name) }
+    var apiKey by rememberSaveable { mutableStateOf(settings.webSearchApiKey) }
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    Text("Escolha o provedor de busca e cole a chave de API correspondente.", color = palette.textSecondary)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf(WebSearchProvider.TAVILY, WebSearchProvider.BRAVE).forEach { provider ->
+            OutlinedButton(onClick = { providerName = provider.name }, enabled = !busy) {
+                Text(if (provider == WebSearchProvider.TAVILY) "Tavily" else "Brave")
+            }
+        }
+    }
+    Text("Selecionado: ${if (providerName == WebSearchProvider.TAVILY.name) "Tavily" else "Brave"}", color = palette.textPrimary)
+    OutlinedTextField(
+        value = apiKey, onValueChange = { apiKey = it; message = null },
+        modifier = Modifier.fillMaxWidth(), label = { Text("Chave de API") }, singleLine = true,
+        visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+    )
+    Text("A chave fica no armazenamento privado do app. A consulta enviada ao provedor pode conter dados da conversa; web_search pede aprovação.", style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
+    OutlinedButton(enabled = !busy, onClick = {
+        busy = true
+        scope.launch {
+            val result = onSave(WebSearchProvider.valueOf(providerName), apiKey)
+            busy = false
+            message = result.fold({ "Configuração salva." }, { "Não foi possível salvar: ${it.message}" })
+        }
+    }) { Text(if (busy) "Salvando…" else "Salvar busca web") }
+    message?.let { Text(it, color = if (it.startsWith("Não")) palette.danger else palette.success) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,11 +1450,14 @@ private fun modelSummary(settings: TalosSettings): String =
     settings.model.ifBlank { "Nenhum modelo definido" }
 
 private fun approvalsSummary(settings: TalosSettings): String {
-    val count = settings.autoApprovedTools.size
-    return when (count) {
-        0 -> "Nenhuma ferramenta liberada"
-        1 -> "1 ferramenta liberada"
-        else -> "$count ferramentas liberadas"
+    val tools = settings.autoApprovedTools.size
+    val prefixes = settings.shellCommandPrefixes.size
+    return when {
+        tools == 0 && prefixes == 0 -> "Nenhuma liberação permanente"
+        tools > 0 && prefixes > 0 -> "$tools ferramentas · $prefixes prefixos shell"
+        prefixes > 0 -> "$prefixes prefixos shell"
+        tools == 1 -> "1 ferramenta liberada"
+        else -> "$tools ferramentas liberadas"
     }
 }
 
